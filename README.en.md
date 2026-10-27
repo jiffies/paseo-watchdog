@@ -140,3 +140,7 @@ Tests use simulated usage reports, agents, and timers. They cover cancellation r
 Start with [server/watchdog.ts](server/watchdog.ts) for monitoring, [server/quota.ts](server/quota.ts) for quota decisions, [client/panel.tsx](client/panel.tsx) for the UI, and [shared/control.ts](shared/control.ts) for the RPC contract. This is an independent implementation with no dependency on another Auto Resume plugin.
 
 [Issues](https://github.com/jiffies/paseo-watchdog/issues), compatibility fixes, bug fixes, and test improvements are welcome. Include Paseo versions, a sanitized error summary, and reproduction steps. Do not publish tokens, full credentials, or logs containing private information.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

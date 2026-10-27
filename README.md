@@ -126,3 +126,7 @@ npm test
 核心逻辑在 [server/watchdog.ts](server/watchdog.ts)，额度判断在 [server/quota.ts](server/quota.ts)，界面在 [client/panel.tsx](client/panel.tsx)，RPC 契约在 [shared/control.ts](shared/control.ts)。这是独立实现，不依赖其他 Auto Resume 插件。
 
 欢迎通过 [Issues](https://github.com/jiffies/paseo-watchdog/issues) 反馈问题，或提交兼容性、错误修复和测试改进。反馈时请附 Paseo 版本、错误摘要和复现步骤；不要公开 token、完整凭据或含私人信息的日志。
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。
