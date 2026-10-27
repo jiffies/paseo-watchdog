@@ -1,92 +1,128 @@
-# Paseo Watchdog（极简、一次性额度恢复）
+# Paseo Watchdog
 
-只监控你**手动开启的当前 Claude Code Agent**。当它因五小时使用额度中断后，插件通过 Paseo 自带的 Usage 查询查看当前 Agent 的同一账号，确认额度恢复后，对**原 Agent** 发送一次：
+**简体中文** · [English](README.en.md)
+
+**手动开启，额度恢复后继续一次，然后自动关闭。**
+
+Paseo Watchdog 为 [Paseo](https://paseo.sh) 中的 Claude Code Agent 提供一次性额度恢复。当前任务因明确的额度限制中断后，它通过 Paseo Usage 确认同一账号的额度已经恢复，再向**原 Agent** 发送一次：
 
 > 继续当前未完成的任务。
 
-然后自动关闭。**轮询不发送对话、不调用模型、不创建新 Agent 或分支。**
+| 设计     | 具体行为                                                                  |
+| -------- | ------------------------------------------------------------------------- |
+| 简单     | 只处理明确的额度失败；不创建新 Agent、分支或任务编排。                    |
+| 可控     | 默认关闭，按 Agent 手动开启；可查看状态、主动取消，每次开启最多发送一次。 |
+| 保守恢复 | 必须观察到额度耗尽及后续恢复；数据过期、缺失或不确定时不发送。            |
+| 低干扰   | 等待期间只查询 Paseo Usage，不向 Claude 发送测试消息，不调用模型。        |
 
-## 兼容性和准备
+## 快速开始
 
-- Paseo daemon 与客户端均需 **0.12.0+**；使用 0.12 的 Agent 面板接口，也兼容 0.13 保留的旧接口。
-- daemon 所在机器必须能运行 `paseo` CLI，并支持 `paseo usage ls --agent <agent-id> --json --refresh`。
-- 当前 MVP **仅支持 Claude Code（provider=`claude`）**。不支持 Codex、API Key 额度、代理网关和自定义 provider。
-- 如果 Windows 机器的 `paseo` CLI 是 `.cmd`，插件将通过 `cmd.exe` 启动；Linux/WSL/macOS 直接调用二进制，均不使用外部 API 凭据。
+需要 **Paseo daemon 与客户端 0.12.0+**、Claude Code Agent，以及 daemon 环境中可运行的 `paseo` CLI。当前仅支持 `provider=claude`；不支持 Codex、API Key 额度、代理网关或自定义 provider。
 
-建议先在**运行 Paseo daemon 的同一环境**检查：
-
-```bash
-paseo usage ls --json --refresh
-# 已有 Agent ID 时：
-paseo usage ls --agent YOUR_AGENT_ID --json --refresh
-```
-
-应返回一个 `sourceId: "claude"` 的报告，`report.windows` 包含 `id: "five_hour"`、`usedPct` 和（通常）`resetsAt`。
-
-## 安装
-
-从 GitHub 安装到运行 Paseo daemon 的机器：
+在 **Settings → Plugins** 中选择目标主机，打开插件开关，然后在该 daemon 所在机器执行：
 
 ```bash
 paseo plugin install github:jiffies/paseo-watchdog
+paseo plugin ls
 ```
 
-也可以把源码下载到该机器的持久目录，再从本地安装：
+确认 `paseo-watchdog` 显示为 `running`，且插件开关已启用。安装无需 `npm install`；运行时依赖由 Paseo 提供。安装插件意味着信任它在 daemon 机器上的执行权限，详见下方[安全边界](#安全边界)。
+
+<details>
+<summary>从本地目录安装</summary>
+
+把源码放在 daemon 机器的持久目录中，然后运行：
 
 ```bash
 paseo plugin install /absolute/path/to/paseo-watchdog
 ```
 
-**安装不需要 `npm install`**：Paseo 会提供插件运行时的 SDK、React、Zod 等依赖。`package.json` 和锁文件只为本地审计、类型检查准备。源码验证使用 Node.js 24+：
+也可以在 **Settings → Plugins → Plugin source** 填入该绝对路径，再点击 **Install plugin**。路径必须在 daemon 所在机器上存在。[Paseo 安装说明](https://paseo.sh/docs/plugins.md)
+
+</details>
+
+开始运行 Claude 任务后，在同一个 Agent 的对话框输入：
+
+```text
+/paseo-watchdog
+```
+
+建议在额度中断前开启。如果 Agent 已处于 `error` 状态，且 `lastError` 包含可识别的额度错误，也可以此时开启。
+
+## 三个命令
+
+| 命令                                      | 用途                                             |
+| ----------------------------------------- | ------------------------------------------------ |
+| `/paseo-watchdog` 或 `/paseo-watchdog on` | 为当前 Agent 开启一次性监控。                    |
+| `/paseo-watchdog status`                  | 查看监控状态、额度、重置时间和下次检查时间。     |
+| `/paseo-watchdog off`                     | 取消尚未提交的自动恢复；已经提交的消息无法撤回。 |
+
+命令由 Paseo 客户端处理，不会作为对话发送给 Claude。每次命令会打开状态面板；面板中的“刷新状态”只读取插件状态，不调用模型。
+
+## 工作流程
+
+<p align="center">
+  <img src="docs/assets/workflow-zh.png" alt="手动开启监控；遇到明确额度失败后查询 Paseo Usage，未恢复则等待，确认恢复后向原 Agent 发送一次继续消息并结束监控。正常完成或其他错误也会结束监控。" width="640">
+</p>
+
+捕获到明确的额度失败后才查询用量。若确认额度耗尽且报告提供了未来重置时间，就等到**重置后约一分钟**再查；否则每 **15 分钟**检查一次。重置时间只决定何时检查，不能代替额度恢复的证据。
+
+查询使用：
 
 ```bash
-cd /absolute/path/to/paseo-watchdog
+paseo usage ls --agent YOUR_AGENT_ID --json --refresh
+```
+
+恢复时只向原 Agent 发送一次普通继续消息，随后结束监控。发送失败也不会自动重试。正常完成、非额度失败和取消会结束本轮监控；等待期间检测到新轮次、新用户消息、关闭或归档，也会取消恢复。
+
+## 安全如何落实
+
+- **先确认耗尽，再确认恢复。** 至少观察到一次额度窗口使用率 `>= 99%`，随后五小时窗口降至 `<= 95%`，且其他已报告窗口均低于 `99%`，才允许恢复。
+- **未知数据不放行。** 报告必须来自唯一的 Claude 账号；数据时间与当前时间的偏差不得超过 10 分钟。窗口数值缺失、无效，或此前耗尽的窗口从报告中消失时，继续等待。检测到报告账号改变时停止监控。
+- **发送前再检查。** 重新读取 Agent 状态，并在提交前核对监控是否已被取消，避免旧检查覆盖新的关闭操作。
+- **不接管权限。** 继续消息沿用原 Agent 的权限和运行方式；插件不会批准工具权限请求或改变权限模式。
+- **不自行管理凭据。** 插件不直接读取、存储或输出 Claude OAuth token；用量查询交给 Paseo 已有的 Usage 能力，也无需为插件单独配置 API Key。
+
+### 安全边界
+
+Paseo 插件是**受信任、无沙箱的代码**，运行时具有 daemon 用户的访问权限。上述保护来自插件逻辑，并非操作系统隔离；Paseo 自身仍可能按正常机制读取保存的登录信息、访问用量接口。[Paseo 插件信任模型](https://paseo.sh/docs/plugins.md)
+
+读取远端状态与发送消息是两次独立调用，无法保证两者之间的远端变化都能及时被观察到。`off` 能取消尚未提交的恢复，不能撤回已交给 daemon 的消息。
+
+用量查询不消耗 Claude 对话 token，但会产生用量接口请求；真正恢复任务后会正常消耗模型额度，Agent 也会按原有权限继续执行任务。
+
+## 已知限制
+
+- 仅处理明确的额度失败。静默停住、被包装成正常完成的额度错误，或首次检查前额度就已恢复，都可能不会触发自动恢复。
+- 监控只保存在内存中。daemon 重启、插件重载或禁用后，需要重新手动开启。
+- 每次开启最多恢复一次，不会持续自动续跑。需要下一次恢复时，再次输入开启命令。
+- 中英文支持指项目文档；当前状态面板和自动继续提示使用中文。
+- 使用 0.12 的 Agent 面板接口，并兼容 0.13 保留的旧接口。Windows 使用 `cmd.exe` 调用 CLI，Linux、WSL 和 macOS 直接调用 `paseo`；Windows 和手机界面尚未完成实机验证。
+
+## 排查问题
+
+| 情况               | 检查方式                                                                                           |
+| ------------------ | -------------------------------------------------------------------------------------------------- |
+| 安装提示版本不兼容 | 在 Settings → About 核对目标 daemon 与客户端版本，均需 0.12.0+。                                   |
+| 插件没有运行       | 查看 `paseo plugin ls`、插件开关，以及 `paseo plugin logs paseo-watchdog`。                        |
+| 已开启但没有查询   | `armed` 表示正在等明确的额度失败，此时不会轮询。                                                   |
+| 一直等待、不继续   | 查看状态面板；确认已观察到耗尽，且当前用量报告完整、有效。                                         |
+| Usage 查询失败     | 在 daemon 的同一环境运行上面的 `paseo usage ls --agent ...` 命令，确认 CLI 能查询该 Agent 的账号。 |
+
+GitHub 来源的安装可用 `paseo plugin update paseo-watchdog` 更新。本地源码修改后，用 `paseo plugin reload paseo-watchdog` 重新加载；重载会清除现有监控。
+
+## 开发与贡献
+
+源码验证使用 **Node.js 24+**：
+
+```bash
 npm ci --ignore-scripts --no-audit --no-fund
 npm run typecheck
 npm test
 ```
 
-在 Paseo 的 **Settings → Plugins** 中确认全局插件开关和本插件均启用。如有问题，可用：
+测试使用模拟用量、Agent 和定时器，覆盖取消竞态、额度缺失、账号变化、单次发送及 0.12 面板接口。当前验证包括 0.12 daemon 安装运行、0.12/0.13 类型检查和模拟测试；尚未完成真实 Claude 额度耗尽到自动恢复的端到端验证。
 
-```bash
-paseo plugin logs paseo-watchdog
-```
+核心逻辑在 [server/watchdog.ts](server/watchdog.ts)，额度判断在 [server/quota.ts](server/quota.ts)，界面在 [client/panel.tsx](client/panel.tsx)，RPC 契约在 [shared/control.ts](shared/control.ts)。这是独立实现，不依赖其他 Auto Resume 插件。
 
-## 使用
-
-在需要监控的 Claude Agent 对话输入：
-
-- `/paseo-watchdog` 或 `/paseo-watchdog on`：为**当前 Agent** 开启**一次性**额度监控。
-- `/paseo-watchdog status`：查看状态、额度、最后查询时间、下次查询和重置时间。
-- `/paseo-watchdog off`：立刻取消，不发送继续指令。
-
-每次命令会打开一个简洁的状态面板。推荐**在任务开始运行后、额度中断前**启用；如果已经出现了 Paseo 可识别的额度错误（Agent 状态是 `error`，且 `lastError` 明确包含额度限制），此时开启也会尝试接管等待。
-
-工作规则：
-
-1. 不断检查的事情为零：只有捕获到该 Agent 的 `failed` 且错误属于额度限制，才启动额度检查。
-2. 查询走 `paseo usage ls --agent ... --json --refresh`，不会向 Claude 发送消息。首次确认额度耗尽后，若报告里给出了重置时间，**优先睡到重置后约一分钟**；否则 15 分钟重试一次。
-3. 必须亲眼观察到至少一次额度耗尽（`usedPct >= 99%`），随后观察到五小时已使用额度 `<= 95%`，且其他已知额度不再耗尽，才会恢复。此前耗尽的窗口必须仍在报告中，并有明确的可用额度；任何已报告窗口数值未知或无效时**不发送**。
-4. 检查到别人已在该 Agent 发起新轮次、会话关闭、归档或有新用户消息，则自动取消。
-5. 额度恢复后，对**原 Agent ID** 发送一次普通的“继续当前未完成的任务。”；不会指定工作分支，不会循环重试。
-
-## 安全边界与已知限制
-
-- 代码没有读取、存储、输出 Claude OAuth token。额度检查由 Paseo 现成 Usage 能力执行；因此 `paseo` daemon 本身可能仍会按正常机制读取其已保存的登录信息。
-- **Paseo 插件运行时不是安全沙箱**。这份插件逻辑可以完整审计，仅需执行 CLI、使用 Paseo SDK 和短期内存状态。安装任何插件都意味着信任它在 daemon 机器上的执行权限。
-- Watchdog 状态保存在插件**进程内存**。重启 Paseo daemon、插件 reload/disable 会取消当前监控，需重新输入命令；MVP 不持久化。
-- 发送前会再次检查取消状态；已经提交给 daemon 的消息无法通过 `/paseo-watchdog off` 撤回。读取远端状态和发送是两次独立调用，无法保证远端恰在两者之间发生的变化都能被及时观察到。
-- 必须能观察到**明确的失败事件及至少一次耗尽报告**。如果 Claude 只是默默停住、额度错误被包装为正常完成、用量在首次检查前已刷新，插件会保守地不恢复。
-- 这不是无限时长任务编排器；每次手动开启最多自动恢复一次。普通完成、非额度失败和取消都会结束本轮监控。
-- `--refresh` 可能访问 Paseo 内置 Usage 数据源，消耗**少量接口查询**，但不会消耗 Claude 对话 token；只有恢复时的一条继续消息会消耗模型 token。
-
-## 代码清单
-
-- `index.client.tsx`：注册 `/paseo-watchdog`，命令由 Paseo 客户端拦截，不发给 Claude。
-- `client/panel.tsx`：只读状态面板。
-- `index.server.ts`：注册额度中断生命周期钩子与状态 RPC。
-- `server/watchdog.ts`：单次恢复的计时与安全守卫。
-- `server/quota.ts`：无副作用的额度和异常检测，可独立测试。
-- `shared/control.ts`：客户端与 daemon 之间的类型校验。
-
-本项目是独立实现，不依赖第三方 Auto Resume 插件。
+欢迎通过 [Issues](https://github.com/jiffies/paseo-watchdog/issues) 反馈问题，或提交兼容性、错误修复和测试改进。反馈时请附 Paseo 版本、错误摘要和复现步骤；不要公开 token、完整凭据或含私人信息的日志。
