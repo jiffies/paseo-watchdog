@@ -1,0 +1,12 @@
+node_modules/
+.env*
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+coverage/
+.DS_Store
+*Zone.Identifier
+*zone.identifier
