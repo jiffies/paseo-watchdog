@@ -177,6 +177,18 @@ test("enable queries immediately, then waits for reset plus one minute without i
   assert.equal(usageQueries, 2);
   assert.deepEqual(f.sent, ["继续当前未完成的任务。"]);
   assert.equal((await f.control("status")).phase, "armed");
+  const status = await f.control("status");
+  assert.equal(status.triggerCount, 1);
+  assert.equal(status.submittedCount, 1);
+  assert.equal(status.unknownCount, 0);
+  assert.deepEqual(status.triggers, [
+    {
+      id: 1,
+      at: new Date().toISOString(),
+      prompt: f.sent[0],
+      result: "submitted",
+    },
+  ]);
 });
 
 test("initial check populates status but never sends, even when enabling after a quota failure", async (t) => {
@@ -203,6 +215,7 @@ test("normal completion, manual cancellation and unrelated errors never become q
     await f.watchdog.onTurnEnded("test-agent", "claude", outcome, f.paseo);
     await f.poll();
     assert.equal(f.sent.length, 0);
+    assert.equal((await f.control("status")).triggerCount, 0);
     assert.equal((await f.control("status")).phase, "armed");
   }
 });
@@ -474,6 +487,15 @@ test("uncertain send is never retried for the same interruption", async (t) => {
   await f.poll();
   assert.equal(attempts, 1);
   assert.equal((await f.control("status")).phase, "armed");
+  const status = await f.control("status");
+  assert.equal(status.triggerCount, 1);
+  assert.equal(status.submittedCount, 0);
+  assert.equal(status.unknownCount, 1);
+  assert.equal(status.triggers[0].result, "unknown");
+  assert.equal(
+    JSON.stringify(status).includes("synthetic-private-error"),
+    false,
+  );
 });
 
 test("late send acknowledgement cannot override off", async (t) => {
@@ -488,11 +510,23 @@ test("late send acknowledgement cannot override off", async (t) => {
   };
   await f.poll();
   assert.equal((await f.control("status")).phase, "resuming");
+  const sending = await f.control("status");
+  assert.equal(sending.triggerCount, 1);
+  assert.equal(sending.submittedCount, 0);
+  assert.equal(sending.triggers[0].result, "sending");
   await f.control("off");
   acknowledge();
   await flush();
   assert.equal((await f.control("status")).phase, "stopped");
   assert.equal((await f.control("status")).nextCheckAt, null);
+  const submitted = await f.control("status");
+  assert.equal(submitted.submittedCount, 1);
+  assert.equal(submitted.triggers[0].result, "submitted");
+  assert.equal(
+    sending.triggers[0].result,
+    "sending",
+    "Previous status snapshots stay detached",
+  );
 });
 
 test("a new quota failure before the old send acknowledgement keeps its own pending recovery", async (t) => {
@@ -518,4 +552,56 @@ test("unavailable or archived agent stops protection", async (t) => {
   await f.poll();
   assert.equal((await f.control("status")).phase, "stopped");
   assert.equal(f.sent.length, 0);
+});
+
+test("bounded trigger history keeps lifetime totals and survives off/on without leaking across agents", async (t) => {
+  const f = setup(t);
+  await f.start();
+  for (let cycle = 0; cycle < 25; cycle++) {
+    f.watchdog.onTurnStarted("test-agent");
+    await f.fail();
+    await f.poll();
+  }
+  const status = await f.control("status");
+  assert.equal(status.triggerCount, 25);
+  assert.equal(status.submittedCount, 25);
+  assert.equal(status.unknownCount, 0);
+  assert.equal(status.triggers.length, 20);
+  assert.equal(status.triggers[0].id, 25);
+  assert.equal(status.triggers.at(-1).id, 6);
+  await f.control("off");
+  await f.control("on");
+  assert.deepEqual((await f.control("status")).triggers, status.triggers);
+  assert.equal((await f.control("status")).triggerCount, 25);
+  const other = await f.watchdog.control("other-agent", "status", f.paseo);
+  assert.equal(other.triggerCount, 0);
+  assert.deepEqual(other.triggers, []);
+  f.watchdog.dispose();
+  assert.equal((await f.control("status")).triggerCount, 0);
+});
+
+test("a late failed send records an unknown result without re-enabling protection", async (t) => {
+  const f = setup(t);
+  await f.start();
+  await f.fail();
+  let reject;
+  f.ref.send = () =>
+    new Promise((_, fail) => {
+      reject = fail;
+    });
+  await f.poll();
+  await f.control("off");
+  reject(new Error("synthetic-private-error"));
+  await flush();
+  const status = await f.control("status");
+  assert.equal(status.phase, "stopped");
+  assert.equal(status.nextCheckAt, null);
+  assert.equal(status.triggerCount, 1);
+  assert.equal(status.submittedCount, 0);
+  assert.equal(status.unknownCount, 1);
+  assert.equal(status.triggers[0].result, "unknown");
+  assert.equal(
+    JSON.stringify(status).includes("synthetic-private-error"),
+    false,
+  );
 });

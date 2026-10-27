@@ -57,7 +57,7 @@ test("registers an agent panel using the Paseo 0.12 client contract", async () =
   ]);
 });
 
-function mountPanel(t, control, agentId = "test-agent") {
+function mountPanel(t, control, agentId = "test-agent", initialState = null) {
   const values = [];
   const writes = [];
   let effect;
@@ -68,6 +68,7 @@ function mountPanel(t, control, agentId = "test-agent") {
       },
       useState: (initial) => {
         const index = values.length;
+        if (index === 0 && initialState) initial = initialState;
         values.push(initial);
         return [
           initial,
@@ -83,7 +84,12 @@ function mountPanel(t, control, agentId = "test-agent") {
       jsx: (type, props) => ({ type, props }),
       jsxs: (type, props) => ({ type, props }),
     },
-    "react-native": { Pressable: "Pressable", Text: "Text", View: "View" },
+    "react-native": {
+      Pressable: "Pressable",
+      ScrollView: "ScrollView",
+      Text: "Text",
+      View: "View",
+    },
     "@getpaseo/plugin/client": { useRpc: () => control },
     "../shared/control": { watchdogControl: {} },
   });
@@ -142,6 +148,44 @@ test("a mounted panel replaces stale off after a command without reopening", asy
   t.mock.timers.tick(30_000);
   await flush();
   assert.equal(calls.length, 3);
+});
+
+test("panel displays trigger totals, time, prompt and distinct acknowledgement results", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const status = {
+    phase: "armed",
+    triggerCount: 3,
+    submittedCount: 1,
+    unknownCount: 1,
+    triggers: ["sending", "unknown", "submitted"].map((result, index) => ({
+      id: 3 - index,
+      at: "2026-01-01T00:00:00Z",
+      prompt: "继续当前未完成的任务。",
+      result,
+    })),
+  };
+  const panel = mountPanel(t, async () => status, "test-agent", status);
+  function text(node) {
+    if (node == null || typeof node === "boolean") return "";
+    if (typeof node !== "object") return String(node);
+    if (Array.isArray(node)) return node.map(text).join("");
+    return text(node.props?.children);
+  }
+  const rendered = text(panel.view);
+  assert.equal(panel.view.type, "ScrollView");
+  assert.ok(
+    rendered.includes("共触发 3 次 · 已确认提交 1 次 · 失败或结果未知 1 次"),
+  );
+  for (const expected of [
+    "正在提交",
+    "已确认提交",
+    "发送失败或结果未知",
+    "继续当前未完成的任务。",
+    "最近 20 条",
+    new Date(status.triggers[0].at).toLocaleString(),
+  ]) {
+    assert.ok(rendered.includes(expected), expected);
+  }
 });
 
 test("slow panel RPCs do not overlap and late results cannot update an unmounted panel", async (t) => {

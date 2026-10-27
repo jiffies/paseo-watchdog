@@ -7,6 +7,7 @@ const execFileAsync = promisify(execFile);
 const CHECK_EVERY_MS = 15 * 60_000;
 const RESET_GRACE_MS = 60_000;
 const CONTINUE_PROMPT = "继续当前未完成的任务。";
+const HISTORY_LIMIT = 20;
 
 type Phase =
   "off" | "armed" | "waiting" | "checking" | "resuming" | "resumed" | "stopped";
@@ -19,6 +20,13 @@ type TurnOutcome =
 interface Pending {
   activityVersion: number;
   lastUserMessageAt: string | null;
+}
+
+interface TriggerRecord {
+  id: number;
+  at: string;
+  prompt: string;
+  result: "sending" | "submitted" | "unknown";
 }
 
 interface WatchState {
@@ -35,11 +43,24 @@ interface WatchState {
   usedPct: number | null;
   reportId: string | null;
   exhaustedWindowIds: string[];
+  triggerCount: number;
+  submittedCount: number;
+  unknownCount: number;
+  triggers: TriggerRecord[];
 }
 
 export type WatchdogStatus = Pick<
   WatchState,
-  "phase" | "message" | "lastCheckAt" | "nextCheckAt" | "resetsAt" | "usedPct"
+  | "phase"
+  | "message"
+  | "lastCheckAt"
+  | "nextCheckAt"
+  | "resetsAt"
+  | "usedPct"
+  | "triggerCount"
+  | "submittedCount"
+  | "unknownCount"
+  | "triggers"
 >;
 
 function newState(): WatchState {
@@ -57,6 +78,10 @@ function newState(): WatchState {
     usedPct: null,
     reportId: null,
     exhaustedWindowIds: [],
+    triggerCount: 0,
+    submittedCount: 0,
+    unknownCount: 0,
+    triggers: [],
   };
 }
 
@@ -94,9 +119,30 @@ export class Watchdog {
   }
 
   private status(agentId: string): WatchdogStatus {
-    const { phase, message, lastCheckAt, nextCheckAt, resetsAt, usedPct } =
-      this.state(agentId);
-    return { phase, message, lastCheckAt, nextCheckAt, resetsAt, usedPct };
+    const {
+      phase,
+      message,
+      lastCheckAt,
+      nextCheckAt,
+      resetsAt,
+      usedPct,
+      triggerCount,
+      submittedCount,
+      unknownCount,
+      triggers,
+    } = this.state(agentId);
+    return {
+      phase,
+      message,
+      lastCheckAt,
+      nextCheckAt,
+      resetsAt,
+      usedPct,
+      triggerCount,
+      submittedCount,
+      unknownCount,
+      triggers: triggers.map((record) => ({ ...record })),
+    };
   }
 
   private stop(agentId: string, message: string): void {
@@ -355,12 +401,25 @@ export class Watchdog {
     state.pending = null;
     state.phase = "resuming";
     state.message = "额度可用；正在向原 Agent 发送一次继续指令。";
+    const trigger: TriggerRecord = {
+      id: ++state.triggerCount,
+      at: new Date().toISOString(),
+      prompt: CONTINUE_PROMPT,
+      result: "sending",
+    };
+    state.triggers.unshift(trigger);
+    if (state.triggers.length > HISTORY_LIMIT) state.triggers.pop();
     try {
       await this.paseo.agents.ref(agentId).send(CONTINUE_PROMPT);
+      // Record the actual acknowledgement even if a turn or off happened meanwhile.
+      trigger.result = "submitted";
+      state.submittedCount++;
       if (!current() || state.activityVersion !== activityVersion) return;
       state.phase = "armed";
       state.message = "已发送一次继续消息；持续保护仍开启，下个窗口再检查。";
     } catch {
+      trigger.result = "unknown";
+      state.unknownCount++;
       if (!current() || state.activityVersion !== activityVersion) return;
       state.phase = "armed";
       state.message = "发送失败或结果未知，不重发本次消息；下个窗口仍会检查。";

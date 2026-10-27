@@ -61,6 +61,10 @@ Enable it for tasks that may run for tens of hours. Protection stays enabled aft
 
 Paseo handles these commands in the client; they are not sent to Claude as conversation messages. Each command opens the status panel, which identifies its agent and refreshes cached status every three seconds. The button also refreshes cached status. Neither action queries Usage nor calls a model. Enabling protection starts the first Usage query immediately.
 
+The panel also shows the current agent's **total trigger attempts, confirmed submissions, and failed or uncertain sends**, plus the latest 20 records with their trigger time, prompt, and result. In-flight requests are not counted as confirmed submissions. A confirmed submission means Paseo accepted the message, not that the task completed.
+
+Totals cover the current plugin load and are not limited to the 20 retained records. Turning protection `off` and back `on` retains them. Reloading the plugin or restarting the daemon clears them; earlier sends are not reconstructed. Records contain only the plugin's fixed prompt and send status, with no conversation content or raw errors.
+
 ## How it works
 
 ```mermaid
@@ -112,7 +116,7 @@ Usage checks do not consume Claude conversation tokens, but do make usage-servic
 ## Known limits
 
 - Only explicit quota failures are handled. A silent stall, a lost lifecycle event, or a quota error reported as normal completion may not trigger a resume. Idle status alone cannot distinguish a finished task from a quota pause.
-- Monitoring lives in memory. A daemon restart, plugin reload, or disable clears it; enable it again manually.
+- Monitoring and trigger history live in memory. A daemon restart, plugin reload, or disable clears them; enable protection again manually.
 - Each quota interruption submits at most one continuation; protection spans multiple quota windows. It does not drive a task that the model has normally finished, approve permissions, or retry unrelated errors.
 - English and Chinese are available for the documentation. The panel, status messages, and continuation prompt currently use Chinese.
 - Uses the 0.12 agent panel API, also retained in 0.13. Windows invokes the CLI through `cmd.exe`; Linux, WSL, and macOS invoke `paseo` directly. Windows and mobile UI behavior have not been verified on real devices.

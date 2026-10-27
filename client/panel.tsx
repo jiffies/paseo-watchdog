@@ -1,10 +1,16 @@
 import { useEffect, useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import { Pressable, ScrollView, Text, View } from "react-native";
 import type { RpcOutput } from "@getpaseo/plugin";
 import { useRpc, type PluginAgentPanelProps } from "@getpaseo/plugin/client";
 import { watchdogControl } from "../shared/control";
 
 type State = RpcOutput<typeof watchdogControl>;
+
+const triggerLabels = {
+  sending: "正在提交",
+  submitted: "已确认提交",
+  unknown: "发送失败或结果未知",
+};
 
 function prettyDate(value: string | null): string {
   return value ? new Date(value).toLocaleString() : "—";
@@ -52,13 +58,9 @@ export function WatchdogPanel({ agentId, theme }: PluginAgentPanelProps) {
   const foreground = theme.colors.foreground;
   const muted = theme.colors.foregroundMuted ?? foreground;
   return (
-    <View
-      style={{
-        flex: 1,
-        padding: 24,
-        backgroundColor: theme.colors.surface0,
-        gap: 12,
-      }}
+    <ScrollView
+      style={{ flex: 1, backgroundColor: theme.colors.surface0 }}
+      contentContainerStyle={{ padding: 24, gap: 12 }}
     >
       <Text style={{ fontSize: 20, fontWeight: "600", color: foreground }}>
         Paseo Watchdog
@@ -102,6 +104,48 @@ export function WatchdogPanel({ agentId, theme }: PluginAgentPanelProps) {
           {loading ? "读取中…" : "刷新状态（不调用 Claude）"}
         </Text>
       </Pressable>
+      <View style={{ gap: 8, marginTop: 12 }}>
+        <Text style={{ fontSize: 16, fontWeight: "600", color: foreground }}>
+          自动继续记录
+        </Text>
+        <Text style={{ color: foreground }}>
+          共触发 {state?.triggerCount ?? "—"} 次 · 已确认提交{" "}
+          {state?.submittedCount ?? "—"} 次 · 失败或结果未知{" "}
+          {state?.unknownCount ?? "—"} 次
+        </Text>
+        <Text style={{ color: muted }}>
+          本次插件加载期间累计，保留最近 20 条明细；重载或重启后清空。
+          已确认提交表示 Paseo 已接收，不代表任务已完成。
+        </Text>
+        {state?.triggers?.length === 0 ? (
+          <Text style={{ color: muted }}>尚未触发自动继续。</Text>
+        ) : null}
+        {(state?.triggers ?? []).map((trigger) => (
+          <View
+            key={trigger.id}
+            style={{
+              padding: 12,
+              gap: 4,
+              backgroundColor: theme.colors.surface1,
+            }}
+          >
+            <Text
+              style={{
+                color:
+                  trigger.result === "unknown"
+                    ? theme.colors.statusDanger
+                    : foreground,
+              }}
+            >
+              第 {trigger.id} 次 · {prettyDate(trigger.at)} ·{" "}
+              {triggerLabels[trigger.result]}
+            </Text>
+            <Text selectable style={{ color: muted }}>
+              提示词：{trigger.prompt}
+            </Text>
+          </View>
+        ))}
+      </View>
       <Text style={{ color: muted, marginTop: 12 }}>
         命令：/paseo-watchdog 开启；/paseo-watchdog off 取消；/paseo-watchdog
         status 查询。
@@ -110,6 +154,6 @@ export function WatchdogPanel({ agentId, theme }: PluginAgentPanelProps) {
         缺少重置时间或查询失败时每 15 分钟重试。插件重载或 daemon
         重启后需重新开启。
       </Text>
-    </View>
+    </ScrollView>
   );
 }
