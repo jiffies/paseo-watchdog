@@ -9,11 +9,23 @@ export default function contribute(server: PluginServerContext) {
     watchdog.control(agentId, action, paseo),
   );
   server.on("agent.turn_ended", (event, { paseo }) =>
-    watchdog.onTurnEnded(event.agent.id, event.agent.provider, event.outcome, paseo),
+    watchdog.onTurnEnded(
+      event.agent.id,
+      event.agent.provider,
+      event.outcome,
+      paseo,
+      event.turnId,
+    ),
   );
-  server.on("agent.turn_started", (event) => watchdog.onTurnStarted(event.agent.id));
-  server.on("agent.closed", (event) => watchdog.onArchivedOrClosed(event.agent.id));
-  server.on("agent.archived", (event) => watchdog.onArchivedOrClosed(event.agent.id));
+  server.on("agent.turn_started", (event) =>
+    watchdog.onTurnStarted(event.agent.id),
+  );
+  server.on("agent.closed", (event) =>
+    watchdog.onArchivedOrClosed(event.agent.id),
+  );
+  server.on("agent.archived", (event) =>
+    watchdog.onArchivedOrClosed(event.agent.id),
+  );
 
   return () => watchdog.dispose();
 }

@@ -605,3 +605,176 @@ test("a late failed send records an unknown result without re-enabling protectio
     false,
   );
 });
+
+function nativeNotice(f, id = "native-limit") {
+  f.snapshot.lastUsage = { outputTokens: 0 };
+  f.snapshot.status = "idle";
+  f.snapshot.lastError = null;
+  const page = {
+    hasNewer: false,
+    staleCursor: false,
+    gap: null,
+    entries: [
+      {
+        provider: "claude",
+        timestamp: f.snapshot.lastUserMessageAt,
+        turnId: "foreground-turn-7",
+        item: {
+          type: "assistant_message",
+          messageId: id,
+          text: "You've hit your session limit · resets 1:20am (Asia/Taipei)",
+        },
+      },
+    ],
+  };
+  f.ref.timeline = {
+    refetch: async (options) => {
+      assert.deepEqual(options, { direction: "tail", limit: 20 });
+      return page;
+    },
+  };
+  return page;
+}
+
+test("recovers the reported idle/zero-output quota notice after quota reset, exactly once", async (t) => {
+  const f = setup(t);
+  nativeNotice(f);
+  queryUsage = async () => usage(0, 35, "claude:test-account", null);
+  await f.start();
+  assert.deepEqual(f.sent, ["继续当前未完成的任务。"]);
+  assert.equal((await f.control("status")).submittedCount, 1);
+  await f.poll();
+  await f.poll();
+  assert.equal(
+    f.sent.length,
+    1,
+    "Re-reading the same notice must not submit again",
+  );
+});
+
+test("a completed hook with a native quota notice arms recovery without a mid-window usage query", async (t) => {
+  const f = setup(t);
+  await f.start();
+  nativeNotice(f);
+  await f.watchdog.onTurnEnded(
+    "test-agent",
+    "claude",
+    { kind: "completed" },
+    f.paseo,
+    "foreground-turn-7",
+  );
+  assert.equal((await f.control("status")).phase, "waiting");
+  assert.equal(usageQueries, 1);
+  assert.equal(f.sent.length, 0);
+  await f.poll();
+  assert.equal(f.sent.length, 1);
+});
+
+test("unknown sends are not repeated when the same native notice is still in the timeline", async (t) => {
+  const f = setup(t);
+  nativeNotice(f);
+  let attempts = 0;
+  f.ref.send = async () => {
+    attempts++;
+    throw new Error("synthetic-private-error");
+  };
+  await f.start();
+  await f.poll();
+  await f.poll();
+  assert.equal(attempts, 1);
+  assert.equal((await f.control("status")).unknownCount, 1);
+});
+
+test("manual cancellation and unrelated errors suppress native-notice reconciliation", async (t) => {
+  const f = setup(t);
+  await f.start();
+  nativeNotice(f);
+  await f.watchdog.onTurnEnded(
+    "test-agent",
+    "claude",
+    { kind: "completed" },
+    f.paseo,
+    "foreground-turn-7",
+  );
+  await f.watchdog.onTurnEnded(
+    "test-agent",
+    "claude",
+    { kind: "canceled", reason: "user" },
+    f.paseo,
+  );
+  await f.poll();
+  assert.equal(f.sent.length, 0);
+  f.watchdog.onTurnStarted("test-agent");
+  nativeNotice(f, "new-limit");
+  await f.watchdog.onTurnEnded(
+    "test-agent",
+    "claude",
+    { kind: "failed", error: { message: "network timeout" } },
+    f.paseo,
+  );
+  await f.poll();
+  assert.equal(f.sent.length, 0);
+  f.watchdog.onTurnStarted("test-agent");
+  nativeNotice(f, "later-limit");
+  await f.poll();
+  assert.equal(f.sent.length, 1);
+});
+
+test("a later normal reply invalidates a pending native notice even if its hook was missed", async (t) => {
+  const f = setup(t);
+  await f.start();
+  const page = nativeNotice(f);
+  await f.watchdog.onTurnEnded(
+    "test-agent",
+    "claude",
+    { kind: "completed" },
+    f.paseo,
+    "foreground-turn-7",
+  );
+  page.entries.push({
+    ...page.entries[0],
+    item: {
+      type: "assistant_message",
+      messageId: "finished",
+      text: "Task complete.",
+    },
+  });
+  await f.poll();
+  assert.equal(f.sent.length, 0);
+});
+
+test("off while fetching the native notice prevents sending and rescheduling", async (t) => {
+  const f = setup(t);
+  const page = nativeNotice(f);
+  f.ref.timeline.refetch = async () => {
+    await f.control("off");
+    return page;
+  };
+  await f.start();
+  assert.equal(f.sent.length, 0);
+  assert.equal((await f.control("status")).phase, "stopped");
+  assert.equal((await f.control("status")).nextCheckAt, null);
+});
+
+test("a newer generated reply during the usage query prevents sending for the old native notice", async (t) => {
+  const f = setup(t);
+  nativeNotice(f);
+  queryUsage = async () => {
+    f.snapshot.lastUsage = { outputTokens: 150 };
+    return usage();
+  };
+  await f.start();
+  assert.equal(f.sent.length, 0);
+  assert.equal((await f.control("status")).triggerCount, 0);
+});
+
+test("a native notice cannot override an exhausted weekly quota", async (t) => {
+  const f = setup(t);
+  nativeNotice(f);
+  queryUsage = async () => usage(0, 100);
+  await f.start();
+  assert.equal(f.sent.length, 0);
+  queryUsage = async () => usage(0, 35);
+  await f.poll();
+  assert.equal(f.sent.length, 1);
+});

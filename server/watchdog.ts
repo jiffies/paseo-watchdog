@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import { assessClaudeUsage, isQuotaFailure } from "./quota";
+import { findQuotaNotice } from "./quota-notice.mjs";
 
 const execFileAsync = promisify(execFile);
 const CHECK_EVERY_MS = 15 * 60_000;
@@ -20,6 +21,7 @@ type TurnOutcome =
 interface Pending {
   activityVersion: number;
   lastUserMessageAt: string | null;
+  noticeId?: string;
 }
 
 interface TriggerRecord {
@@ -47,6 +49,8 @@ interface WatchState {
   submittedCount: number;
   unknownCount: number;
   triggers: TriggerRecord[];
+  handledNoticeId: string | null;
+  ignoreCurrentNotice: boolean;
 }
 
 export type WatchdogStatus = Pick<
@@ -82,6 +86,8 @@ function newState(): WatchState {
     submittedCount: 0,
     unknownCount: 0,
     triggers: [],
+    handledNoticeId: null,
+    ignoreCurrentNotice: false,
   };
 }
 
@@ -182,6 +188,7 @@ export class Watchdog {
       throw new Error("只能为可用的 Claude Code Agent 开启保护");
     }
     state.armed = true;
+    state.ignoreCurrentNotice = false;
     state.phase = "checking";
     state.message = "持续保护已开启，正在查询额度和五小时窗口重置时间。";
     state.lastCheckAt = state.nextCheckAt = state.resetsAt = null;
@@ -204,6 +211,7 @@ export class Watchdog {
     provider: string,
     outcome: TurnOutcome,
     paseo: PaseoApi,
+    turnId?: string | null,
   ): Promise<void> {
     this.paseo = paseo;
     const state = this.states.get(agentId);
@@ -214,19 +222,27 @@ export class Watchdog {
     }
     const generation = state.generation;
     const activityVersion = ++state.activityVersion;
+    const quotaError =
+      outcome.kind === "failed" &&
+      isQuotaFailure((outcome.error.code ?? "") + " " + outcome.error.message);
+    if (
+      outcome.kind === "canceled" ||
+      (outcome.kind === "failed" && !quotaError)
+    ) {
+      state.ignoreCurrentNotice = true;
+      if (state.pending?.noticeId)
+        state.handledNoticeId = state.pending.noticeId;
+    }
     state.pending = null;
     state.phase = "armed";
-    if (
-      outcome.kind !== "failed" ||
-      !isQuotaFailure((outcome.error.code ?? "") + " " + outcome.error.message)
-    ) {
+    if (!quotaError) {
       state.message =
         outcome.kind === "completed"
           ? "本轮正常完成，不自动续跑；持续保护和窗口检查仍开启。"
           : outcome.kind === "canceled"
             ? "本轮已主动取消，不自动续跑；持续保护和窗口检查仍开启。"
             : "本轮是非额度错误，不自动重试；持续保护和窗口检查仍开启。";
-      return;
+      if (outcome.kind !== "completed" || state.ignoreCurrentNotice) return;
     }
     try {
       const snapshot = (await paseo.agents.ref(agentId).refresh())?.agent;
@@ -246,13 +262,30 @@ export class Watchdog {
         return;
       }
       if (snapshot.activeTurn || snapshot.pendingPermissions?.length) return;
+      let noticeId: string | undefined;
+      if (!quotaError) {
+        if (snapshot.lastUsage?.outputTokens !== 0) return;
+        const page = await paseo.agents
+          .ref(agentId)
+          .timeline.refetch({ direction: "tail", limit: 20 });
+        if (
+          !state.armed ||
+          state.generation !== generation ||
+          state.activityVersion !== activityVersion
+        )
+          return;
+        const notice = findQuotaNotice(page, snapshot, turnId);
+        if (!notice || notice.id === state.handledNoticeId) return;
+        noticeId = notice.id;
+      }
       state.pending = {
         activityVersion,
         lastUserMessageAt: snapshot.lastUserMessageAt ?? null,
+        noticeId,
       };
       state.phase = "waiting";
       state.message =
-        "已记录明确的额度中断；等待计划中的窗口重置检查，中途不查询额度。";
+        "已记录额度错误或原生额度提示；等待计划中的窗口重置检查，中途不查询额度。";
     } catch {
       if (
         !state.armed ||
@@ -269,6 +302,7 @@ export class Watchdog {
     const state = this.states.get(agentId);
     if (!state?.armed) return;
     state.activityVersion++;
+    state.ignoreCurrentNotice = false;
     state.pending = null;
     state.phase = "armed";
     state.message = "新轮次已开始，旧恢复请求已清除；窗口重置检查仍保留。";
@@ -317,6 +351,36 @@ export class Watchdog {
       this.stop(agentId, "Agent 不可用、已关闭或归档，保护停止。");
       return;
     }
+    // Reconcile missed/misclassified completion hooks, including when enabling after a pause.
+    if (
+      !state.ignoreCurrentNotice &&
+      snapshot.lastUsage?.outputTokens === 0 &&
+      !snapshot.activeTurn &&
+      !snapshot.pendingPermissions.length &&
+      (snapshot.status === "idle" || snapshot.status === "error")
+    ) {
+      const page = await this.paseo.agents
+        .ref(agentId)
+        .timeline.refetch({ direction: "tail", limit: 20 });
+      if (!current()) return;
+      if (
+        state.activityVersion === activityVersion &&
+        !state.ignoreCurrentNotice
+      ) {
+        const notice = findQuotaNotice(page, snapshot);
+        if (state.pending?.noticeId && state.pending.noticeId !== notice?.id) {
+          state.handledNoticeId = state.pending.noticeId;
+          state.pending = null;
+        }
+        if (notice && notice.id !== state.handledNoticeId) {
+          state.pending = {
+            activityVersion,
+            lastUserMessageAt: notice.lastUserMessageAt,
+            noticeId: notice.id,
+          };
+        }
+      }
+    }
     let quota;
     try {
       quota = assessClaudeUsage(
@@ -361,7 +425,7 @@ export class Watchdog {
 
     const pending = state.pending;
     if (
-      !allowResume ||
+      (!allowResume && !pending?.noticeId) ||
       quota.state !== "ready" ||
       !pending ||
       pending.activityVersion !== activityVersion
@@ -390,14 +454,17 @@ export class Watchdog {
       finalSnapshot.status === "running" ||
       finalSnapshot.status === "initializing" ||
       finalSnapshot.pendingPermissions?.length ||
+      (pending.noticeId && finalSnapshot.lastUsage?.outputTokens !== 0) ||
       (finalSnapshot.lastUserMessageAt ?? null) !== pending.lastUserMessageAt
     ) {
+      if (pending.noticeId) state.handledNoticeId = pending.noticeId;
       state.pending = null;
       state.phase = "armed";
       state.message =
         "检测到新任务、新消息或待处理确认，取消本次恢复；窗口检查仍保留。";
       return;
     }
+    if (pending.noticeId) state.handledNoticeId = pending.noticeId;
     state.pending = null;
     state.phase = "resuming";
     state.message = "额度可用；正在向原 Agent 发送一次继续指令。";

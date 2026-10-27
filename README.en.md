@@ -93,13 +93,15 @@ The query is:
 paseo usage ls --agent YOUR_AGENT_ID --json --refresh
 ```
 
-The initial query only fills the status panel and schedules a check; it never sends a continuation. At a later check, Watchdog resumes only an explicitly recorded quota interruption with available quota. It submits one ordinary continuation to the original agent and keeps the next window check scheduled. A failed or uncertain send is not retried for the same interruption.
+The initial query normally fills the status panel and schedules a check. If the current conversation already ends in a verified native quota notice and fresh quota is available, it can recover that overdue pause immediately. At a later check, Watchdog resumes only an explicitly recorded quota interruption with available quota. It submits one ordinary continuation to the original agent and keeps the next window check scheduled. A failed or uncertain send is not retried for the same interruption.
 
 Normal completion, manual cancellation of a turn, and unrelated errors clear the pending recovery without resuming those turns; the window timer stays active. Being idle alone is never a reason to resume. A new turn, new user message, or pending permission clears the old recovery request while retaining future protection. Manual `off`, agent closure or archive, and safety exceptions such as an account change disable protection.
 
+To handle Paseo reporting a native quota notice as normal completion, Watchdog also checks recent history when a zero-output turn ends and at scheduled checks. A notice is consumed once, including after an uncertain send. Timeline text is inspected in memory and is not retained in trigger history. The panel shows **used** quota; a sidebar showing **remaining** quota may therefore show 100% while this panel shows 0%.
+
 ## Safety controls
 
-- **Verify the interruption and quota separately.** Paseo must report an explicit quota failure. At the scheduled check, five-hour usage must be `<= 95%` and every other reported window below `99%`. Since there is no mid-window polling, observing usage reach 100% is not required.
+- **Verify the interruption and quota separately.** Paseo must report an explicit quota failure, or the latest zero-output turn must contain an exact native limit notice. At the scheduled check, five-hour usage must be `<= 95%` and every other reported window below `99%`. Since there is no mid-window polling, observing usage reach 100% is not required.
 - **Treat unknown data as unknown.** A report must identify exactly one Claude account, with a fetch time no more than 10 minutes away from the current time. Missing or invalid percentages, or a previously exhausted window disappearing from the report, keep the monitor waiting. A detected account change stops it.
 - **Check again before sending.** The agent is refreshed and cancellation state is checked immediately before submission, so a stale check cannot override a newly processed cancellation.
 - **Keep existing permissions.** The continuation uses the original agent's permissions and execution mode. Watchdog does not approve tool permission requests or change permission modes.
@@ -115,7 +117,7 @@ Usage checks do not consume Claude conversation tokens, but do make usage-servic
 
 ## Known limits
 
-- Only explicit quota failures are handled. A silent stall, a lost lifecycle event, or a quota error reported as normal completion may not trigger a resume. Idle status alone cannot distinguish a finished task from a quota pause.
+- Handles explicit quota failures and the exact native Claude limit notice from the latest zero-output turn. For the latter, it inspects at most the last 20 timeline entries and checks message identity, turn, user-message boundary, and permissions. Quotes, ordinary generated replies, canceled turns, and incomplete history do not authorize recovery. Other notice formats and silent stalls may still be missed. Idle status alone never authorizes a resume.
 - Monitoring and trigger history live in memory. A daemon restart, plugin reload, or disable clears them; enable protection again manually.
 - Each quota interruption submits at most one continuation; protection spans multiple quota windows. It does not drive a task that the model has normally finished, approve permissions, or retry unrelated errors.
 - English and Chinese are available for the documentation. The panel, status messages, and continuation prompt currently use Chinese.
@@ -123,13 +125,13 @@ Usage checks do not consume Claude conversation tokens, but do make usage-servic
 
 ## Troubleshooting
 
-| Symptom                                      | What to check                                                                                                                    |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Installation reports an incompatible version | Check the target daemon and client in Settings → About. Both need 0.12.0+.                                                       |
-| Plugin is not running                        | Check `paseo plugin ls`, the plugin switches, and `paseo plugin logs paseo-watchdog`.                                            |
-| Enabled, but no usage checks                 | Check the last query and next check timestamps. After the initial query, it waits until the scheduled reset check.               |
-| Keeps waiting without resuming               | Inspect the status panel. A quota interruption must be recorded, and fresh quota data must be complete and valid.                |
-| Usage query fails                            | Run the `paseo usage ls --agent ...` command above in the daemon environment and confirm the CLI can query that agent's account. |
+| Symptom                                      | What to check                                                                                                                             |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Installation reports an incompatible version | Check the target daemon and client in Settings → About. Both need 0.12.0+.                                                                |
+| Plugin is not running                        | Check `paseo plugin ls`, the plugin switches, and `paseo plugin logs paseo-watchdog`.                                                     |
+| Enabled, but no usage checks                 | Check the last query and next check timestamps. After the initial query, it waits until the scheduled reset check.                        |
+| Keeps waiting without resuming               | Inspect the status panel. A quota error or verified native limit notice must be present, and fresh quota data must be complete and valid. |
+| Usage query fails                            | Run the `paseo usage ls --agent ...` command above in the daemon environment and confirm the CLI can query that agent's account.          |
 
 Update a GitHub installation with `paseo plugin update paseo-watchdog`. After editing a local installation, use `paseo plugin reload paseo-watchdog`. Reloading clears existing monitoring.
 
@@ -143,7 +145,7 @@ npm run typecheck
 npm test
 ```
 
-Tests use simulated usage reports, agents, and timers. They cover initial usage display, reset scheduling without intermediate queries, stale panel updates, cancellation races, missing quota data, account changes, one send per interruption, more than 48 simulated hours across ten quota windows, and the 0.12 panel contract. Validation includes installation on a 0.12 daemon, type checks against 0.12/0.13, and simulated tests. A real Claude quota-exhaustion-to-recovery cycle has not yet been verified end to end.
+Tests use simulated usage reports, agents, and timers. They cover initial usage display, reset scheduling without intermediate queries, stale panel updates, cancellation races, missing quota data, account changes, one send per interruption, more than 48 simulated hours across ten quota windows, and the 0.12 panel contract. Validation includes installation on a 0.12 daemon, type checks against 0.12/0.13, and simulated tests. One real native-notice pause has been resumed after quota recovery on 0.13.2. Full-window timer behavior remains covered by simulated tests.
 
 Start with [server/watchdog.ts](server/watchdog.ts) for monitoring, [server/quota.ts](server/quota.ts) for quota decisions, [client/panel.tsx](client/panel.tsx) for the UI, and [shared/control.ts](shared/control.ts) for the RPC contract. This is an independent implementation with no dependency on another Auto Resume plugin.
 
