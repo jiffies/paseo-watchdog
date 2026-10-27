@@ -2,5 +2,5 @@
   "id": "paseo-watchdog",
   "name": "Paseo Watchdog",
   "description": "One-shot Claude quota recovery for an explicitly armed Paseo agent.",
-  "requirements": { "paseo": ">=0.13.0" }
+  "requirements": { "paseo": ">=0.12.0" }
 }

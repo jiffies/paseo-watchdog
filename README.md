@@ -8,7 +8,7 @@
 
 ## 兼容性和准备
 
-- Paseo daemon 与客户端均需 **0.13.0+**；最好使用相同最新版本。
+- Paseo daemon 与客户端均需 **0.12.0+**；使用 0.12 的 Agent 面板接口，也兼容 0.13 保留的旧接口。
 - daemon 所在机器必须能运行 `paseo` CLI，并支持 `paseo usage ls --agent <agent-id> --json --refresh`。
 - 当前 MVP **仅支持 Claude Code（provider=`claude`）**。不支持 Codex、API Key 额度、代理网关和自定义 provider。
 - 如果 Windows 机器的 `paseo` CLI 是 `.cmd`，插件将通过 `cmd.exe` 启动；Linux/WSL/macOS 直接调用二进制，均不使用外部 API 凭据。

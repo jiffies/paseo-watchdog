@@ -3,10 +3,11 @@ import { WatchdogPanel } from "./client/panel";
 import { watchdogControl } from "./shared/control";
 
 export default function contribute(client: PluginClientContext) {
-  client.addAgentPanel({
+  client.addWorkspacePanel({
     id: "watchdog",
     title: "Paseo Watchdog",
     icon: "Clock",
+    context: "agent",
     Component: WatchdogPanel,
   });
   client.addSlashCommand({

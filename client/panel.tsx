@@ -10,7 +10,7 @@ function prettyDate(value: string | null): string {
   return value ? new Date(value).toLocaleString() : "—";
 }
 
-export function WatchdogPanel({ params, theme }: PluginAgentPanelProps) {
+export function WatchdogPanel({ agentId, theme }: PluginAgentPanelProps) {
   const control = useRpc(watchdogControl);
   const [state, setState] = useState<State | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -18,14 +18,14 @@ export function WatchdogPanel({ params, theme }: PluginAgentPanelProps) {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      setState(await control({ agentId: params.agentId, action: "status" }));
+      setState(await control({ agentId, action: "status" }));
       setError(null);
     } catch (cause) {
       setError(String(cause));
     } finally {
       setLoading(false);
     }
-  }, [control, params.agentId]);
+  }, [control, agentId]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
