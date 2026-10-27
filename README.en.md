@@ -2,20 +2,20 @@
 
 [简体中文](README.md) · **English**
 
-**Enable it manually. Resume once after quota recovery. Then switch off.**
+**Enable it once. Keep the conversation protected. Resume long tasks after quota recovery.**
 
-Paseo Watchdog provides one-time quota recovery for Claude Code agents in [Paseo](https://paseo.sh). After an explicit quota failure, it checks the same account through Paseo Usage. Once recovery is verified, it sends this message to the **original agent**:
+Paseo Watchdog provides continuous quota recovery protection for Claude Code agents in [Paseo](https://paseo.sh). After an explicit quota failure, it checks the same account through Paseo Usage. Once recovery is verified, it sends this message to the **original agent**:
 
 > 继续当前未完成的任务。
 
 The message means “Continue the current unfinished task.”
 
-| Design                | Behavior                                                                                                                 |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Simple                | Handles explicit quota failures. Creates no new agents, branches, or task orchestration.                                 |
-| Under your control    | Off by default. Enable it for one agent, inspect its status, or cancel it. Each activation sends at most one message.    |
-| Conservative recovery | Requires observed exhaustion followed by verified recovery. Stale, missing, or uncertain data never authorizes a resume. |
-| Quiet while waiting   | Queries Paseo Usage without sending test messages to Claude or calling a model.                                          |
+| Design                | Behavior                                                                                                                                                                    |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Simple                | Handles explicit quota failures. Creates no new agents, branches, or task orchestration.                                                                                    |
+| Under your control    | Off by default. Enable it for one agent, inspect its status, or cancel it. Protection stays enabled across turns; each quota interruption submits at most one continuation. |
+| Conservative recovery | Requires observed exhaustion followed by verified recovery. Stale, missing, or uncertain data never authorizes a resume.                                                    |
+| Quiet while waiting   | Queries Paseo Usage without sending test messages to Claude or calling a model.                                                                                             |
 
 ## Quick start
 
@@ -49,15 +49,15 @@ After starting a Claude task, enter this in the same agent's composer:
 /paseo-watchdog
 ```
 
-Enable it before quota exhaustion when possible. You can also enable it after a failure if the agent is in the `error` state and its `lastError` contains a recognizable quota error.
+Enable it for tasks that may run for tens of hours. Protection stays enabled after ordinary replies and can handle later quota interruptions too. Enable it before quota exhaustion when possible. You can also enable it after a failure if the agent is in the `error` state and its `lastError` contains a recognizable quota error.
 
 ## Three commands
 
-| Command                                   | Purpose                                                                                     |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `/paseo-watchdog` or `/paseo-watchdog on` | Enable one-time monitoring for the current agent.                                           |
-| `/paseo-watchdog status`                  | Inspect monitoring status, usage, reset time, and the next check.                           |
-| `/paseo-watchdog off`                     | Cancel a resume that has not been submitted. Already submitted messages cannot be recalled. |
+| Command                                   | Purpose                                                                                |
+| ----------------------------------------- | -------------------------------------------------------------------------------------- |
+| `/paseo-watchdog` or `/paseo-watchdog on` | Enable continuous protection for the current agent.                                    |
+| `/paseo-watchdog status`                  | Inspect monitoring status, usage, reset time, and the next check.                      |
+| `/paseo-watchdog off`                     | Disable protection and cancel a pending resume. Submitted messages cannot be recalled. |
 
 Paseo handles these commands in the client; they are not sent to Claude as conversation messages. Each command opens the status panel. Its refresh button reads plugin status without calling a model.
 
@@ -65,21 +65,22 @@ Paseo handles these commands in the client; they are not sent to Claude as conve
 
 ```mermaid
 flowchart TD
-    A["Run /paseo-watchdog in the current agent"] --> B["Wait for the turn outcome"]
-    B -->|Completed, canceled, or another error| Z["Stop monitoring"]
+    A["Enable /paseo-watchdog"] --> B["Stand by across conversation turns"]
+    B -->|Completion, cancellation, or another error| B
     B -->|Explicit quota failure| Q["Query Paseo Usage"]
     Q --> R{"Exhaustion observed, then recovery verified?"}
     R -->|Yes| S["Send one continuation message to the original agent"]
-    S --> Z
-    R -->|No or unknown| W["Wait until reset + 1 minute, or 15 minutes"]
+    S --> B
+    R -->|No or unknown| W["Check after reset + 1 minute, or every 15 minutes"]
     W --> Q
+    Q -->|New task, message, or pending permission| B
+    B -->|Manual off, closure, or archive| Z["Stop protection"]
+    Q -->|Account change, closure, or archive| Z
     classDef step fill:#dcf5e7,stroke:#a4cdb8,color:#006b32;
     class A,B,Q,R,S,W,Z step;
 ```
 
-[View the original workflow image in Chinese](docs/assets/workflow-zh.png).
-
-Usage checks begin only after an explicit quota failure. Once exhaustion is confirmed, a reported future reset time schedules the next check for **about one minute after the reset**. Otherwise, checks run every **15 minutes**. A reset timestamp determines when to check; it is not evidence of recovery.
+Usage checks begin only after an explicit quota failure. Once exhaustion is confirmed, a reported future reset time schedules the next check for **about one minute after the reset**. Otherwise, checks run every **15 minutes**. **Fifteen minutes is a fallback check interval, not a monitoring deadline. Standby has no automatic expiry.** A reset timestamp determines when to check; it is not evidence of recovery.
 
 The query is:
 
@@ -87,7 +88,9 @@ The query is:
 paseo usage ls --agent YOUR_AGENT_ID --json --refresh
 ```
 
-On recovery, Watchdog sends one ordinary continuation message to the original agent and stops monitoring. A failed send is not retried. Normal completion, cancellation, or an unrelated failure ends monitoring. While waiting, a detected new turn, new user message, closure, or archive cancels recovery too.
+For each verified recovery, Watchdog submits one ordinary continuation message to the original agent, then keeps protecting that conversation for later quota interruptions. A failed or uncertain send is not retried for the same interruption.
+
+Normal completion, manual cancellation of a turn, and unrelated errors return the monitor to standby without resuming those turns. A new turn, new user message, or pending permission clears the old recovery request while retaining future protection. Manual `off`, agent closure or archive, and safety exceptions such as an account change disable protection.
 
 ## Safety controls
 
@@ -109,7 +112,7 @@ Usage checks do not consume Claude conversation tokens, but do make usage-servic
 
 - Only explicit quota failures are handled. A silent stall, a quota error reported as normal completion, or quota recovery before the first check may never trigger a resume.
 - Monitoring lives in memory. A daemon restart, plugin reload, or disable clears it; enable it again manually.
-- Each activation resumes at most once. Enable it again if another recovery is needed.
+- Each quota interruption submits at most one continuation; protection spans multiple quota windows. It does not drive a task that the model has normally finished, approve permissions, or retry unrelated errors.
 - English and Chinese are available for the documentation. The panel, status messages, and continuation prompt currently use Chinese.
 - Uses the 0.12 agent panel API, also retained in 0.13. Windows invokes the CLI through `cmd.exe`; Linux, WSL, and macOS invoke `paseo` directly. Windows and mobile UI behavior have not been verified on real devices.
 
@@ -135,7 +138,7 @@ npm run typecheck
 npm test
 ```
 
-Tests use simulated usage reports, agents, and timers. They cover cancellation races, missing quota data, account changes, one-time sends, and the 0.12 panel contract. Validation includes installation on a 0.12 daemon, type checks against 0.12/0.13, and simulated tests. A real Claude quota-exhaustion-to-recovery cycle has not yet been verified end to end.
+Tests use simulated usage reports, agents, and timers. They cover cancellation races, missing quota data, account changes, one send per interruption, a simulated 48-hour standby, recovery across multiple quota windows, and the 0.12 panel contract. Validation includes installation on a 0.12 daemon, type checks against 0.12/0.13, and simulated tests. A real Claude quota-exhaustion-to-recovery cycle has not yet been verified end to end.
 
 Start with [server/watchdog.ts](server/watchdog.ts) for monitoring, [server/quota.ts](server/quota.ts) for quota decisions, [client/panel.tsx](client/panel.tsx) for the UI, and [shared/control.ts](shared/control.ts) for the RPC contract. This is an independent implementation with no dependency on another Auto Resume plugin.
 
