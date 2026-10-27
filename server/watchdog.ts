@@ -17,11 +17,8 @@ type TurnOutcome =
   | { kind: "failed"; error: { message: string; code?: string } };
 
 interface Pending {
-  generation: number;
+  activityVersion: number;
   lastUserMessageAt: string | null;
-  confirmedExhaustion: boolean;
-  reportId: string | null;
-  exhaustedWindowIds: string[];
 }
 
 interface WatchState {
@@ -30,11 +27,14 @@ interface WatchState {
   armed: boolean;
   pending: Pending | null;
   generation: number;
+  activityVersion: number;
   timer: ReturnType<typeof setTimeout> | null;
   lastCheckAt: string | null;
   nextCheckAt: string | null;
   resetsAt: string | null;
   usedPct: number | null;
+  reportId: string | null;
+  exhaustedWindowIds: string[];
 }
 
 export type WatchdogStatus = Pick<
@@ -49,11 +49,14 @@ function newState(): WatchState {
     armed: false,
     pending: null,
     generation: 0,
+    activityVersion: 0,
     timer: null,
     lastCheckAt: null,
     nextCheckAt: null,
     resetsAt: null,
     usedPct: null,
+    reportId: null,
+    exhaustedWindowIds: [],
   };
 }
 
@@ -82,12 +85,12 @@ export class Watchdog {
   private paseo: PaseoApi | null = null;
 
   private state(agentId: string): WatchState {
-    let value = this.states.get(agentId);
-    if (!value) {
-      value = newState();
-      this.states.set(agentId, value);
+    let state = this.states.get(agentId);
+    if (!state) {
+      state = newState();
+      this.states.set(agentId, state);
     }
-    return value;
+    return state;
   }
 
   private status(agentId: string): WatchdogStatus {
@@ -96,20 +99,16 @@ export class Watchdog {
     return { phase, message, lastCheckAt, nextCheckAt, resetsAt, usedPct };
   }
 
-  private standby(agentId: string, reason: string): void {
+  private stop(agentId: string, message: string): void {
     const state = this.state(agentId);
     state.generation++;
+    state.armed = false;
+    state.pending = null;
     if (state.timer) clearTimeout(state.timer);
     state.timer = null;
-    state.pending = null;
     state.nextCheckAt = null;
-    state.phase = state.armed ? "armed" : "stopped";
-    state.message = reason;
-  }
-
-  private stop(agentId: string, reason: string): void {
-    this.state(agentId).armed = false;
-    this.standby(agentId, reason);
+    state.phase = "stopped";
+    state.message = message;
   }
 
   async control(
@@ -123,37 +122,34 @@ export class Watchdog {
       this.stop(agentId, "已手动关闭。不会发送继续消息。");
       return this.status(agentId);
     }
-
     const state = this.state(agentId);
     if (state.armed) return this.status(agentId);
-    // A later `off` must win even if this `on` RPC is still refreshing the agent.
-    const requestGeneration = ++state.generation;
+    const generation = ++state.generation;
     const snapshot = (await paseo.agents.ref(agentId).refresh())?.agent;
-    if (state.generation !== requestGeneration) return this.status(agentId);
-    if (!snapshot) throw new Error("Paseo 中找不到当前 Agent");
-    if (snapshot.provider !== "claude")
-      throw new Error("MVP 仅支持 Claude Code Agent");
-    if (snapshot.status === "closed" || snapshot.archivedAt) {
-      throw new Error("Agent 已关闭或归档，无法监控");
-    }
-    if (state.armed) return this.status(agentId);
-
-    state.armed = true;
-    state.phase = "armed";
-    state.message =
-      "持续保护已开启：正常回复结束后仍会待命；仅在额度中断后查询用量。";
-    state.lastCheckAt = null;
-    state.nextCheckAt = null;
-    state.usedPct = null;
-    state.resetsAt = null;
-
-    // Also supports enabling after the current turn has already stopped at a quota error.
+    if (state.generation !== generation) return this.status(agentId);
     if (
-      snapshot.status === "error" &&
-      isQuotaFailure(snapshot.lastError ?? "")
+      !snapshot ||
+      snapshot.provider !== "claude" ||
+      snapshot.status === "closed" ||
+      snapshot.archivedAt
     ) {
-      this.startWaiting(agentId, snapshot.lastUserMessageAt ?? null);
+      throw new Error("只能为可用的 Claude Code Agent 开启保护");
     }
+    state.armed = true;
+    state.phase = "checking";
+    state.message = "持续保护已开启，正在查询额度和五小时窗口重置时间。";
+    state.lastCheckAt = state.nextCheckAt = state.resetsAt = null;
+    state.usedPct = null;
+    state.reportId = null;
+    state.exhaustedWindowIds = [];
+    state.pending =
+      snapshot.status === "error" && isQuotaFailure(snapshot.lastError ?? "")
+        ? {
+            activityVersion: state.activityVersion,
+            lastUserMessageAt: snapshot.lastUserMessageAt ?? null,
+          }
+        : null;
+    this.schedule(agentId, 0, false);
     return this.status(agentId);
   }
 
@@ -166,257 +162,214 @@ export class Watchdog {
     this.paseo = paseo;
     const state = this.states.get(agentId);
     if (!state?.armed) return;
-    const generation = state.generation;
     if (provider !== "claude") {
-      this.stop(agentId, "仅支持 Claude Code；监控已停止。");
+      this.stop(agentId, "仅支持 Claude Code；保护已停止。");
       return;
     }
-    if (outcome.kind !== "failed") {
-      this.standby(
-        agentId,
+    const generation = state.generation;
+    const activityVersion = ++state.activityVersion;
+    state.pending = null;
+    state.phase = "armed";
+    if (
+      outcome.kind !== "failed" ||
+      !isQuotaFailure((outcome.error.code ?? "") + " " + outcome.error.message)
+    ) {
+      state.message =
         outcome.kind === "completed"
-          ? "本轮任务已结束；持续保护仍开启，等待后续额度中断。"
-          : "本轮任务已取消，不会自动继续该轮；持续保护仍开启。",
-      );
+          ? "本轮正常完成，不自动续跑；持续保护和窗口检查仍开启。"
+          : outcome.kind === "canceled"
+            ? "本轮已主动取消，不自动续跑；持续保护和窗口检查仍开启。"
+            : "本轮是非额度错误，不自动重试；持续保护和窗口检查仍开启。";
       return;
     }
-    const error = `${outcome.error.code ?? ""} ${outcome.error.message}`;
-    if (!isQuotaFailure(error)) {
-      this.standby(
-        agentId,
-        "本轮失败不是明确的额度限制，不自动重试；持续保护仍开启。",
-      );
-      return;
-    }
-    if (state.pending) return;
     try {
       const snapshot = (await paseo.agents.ref(agentId).refresh())?.agent;
-      if (!state.armed || state.generation !== generation) return;
+      if (
+        !state.armed ||
+        state.generation !== generation ||
+        state.activityVersion !== activityVersion
+      )
+        return;
       if (
         !snapshot ||
         snapshot.provider !== "claude" ||
         snapshot.status === "closed" ||
         snapshot.archivedAt
       ) {
-        this.stop(agentId, "Agent 不可用、已关闭或归档，持续保护停止。");
+        this.stop(agentId, "Agent 不可用、已关闭或归档，保护停止。");
         return;
       }
-      if (snapshot.activeTurn || snapshot.pendingPermissions?.length) {
-        this.standby(
-          agentId,
-          "Agent 已开始其他操作或正在等待确认，取消本次恢复；持续保护仍开启。",
-        );
-        return;
-      }
-      this.startWaiting(agentId, snapshot.lastUserMessageAt ?? null);
+      if (snapshot.activeTurn || snapshot.pendingPermissions?.length) return;
+      state.pending = {
+        activityVersion,
+        lastUserMessageAt: snapshot.lastUserMessageAt ?? null,
+      };
+      state.phase = "waiting";
+      state.message =
+        "已记录明确的额度中断；等待计划中的窗口重置检查，中途不查询额度。";
     } catch {
-      if (!state.armed || state.generation !== generation) return;
-      this.standby(
-        agentId,
-        "无法确认 Agent 状态，未启动本次恢复；持续保护仍开启。",
-      );
+      if (
+        !state.armed ||
+        state.generation !== generation ||
+        state.activityVersion !== activityVersion
+      )
+        return;
+      state.message =
+        "无法确认本次额度中断的 Agent 状态，未安排自动续跑；保护仍开启。";
     }
   }
 
   onTurnStarted(agentId: string): void {
     const state = this.states.get(agentId);
-    if (state?.armed) {
-      this.standby(agentId, "新轮次已开始，旧恢复请求已清除；持续保护仍开启。");
-    }
+    if (!state?.armed) return;
+    state.activityVersion++;
+    state.pending = null;
+    state.phase = "armed";
+    state.message = "新轮次已开始，旧恢复请求已清除；窗口重置检查仍保留。";
   }
 
   onArchivedOrClosed(agentId: string): void {
-    const state = this.states.get(agentId);
-    if (state?.armed) this.stop(agentId, "Agent 已关闭或归档，监控取消。");
+    if (this.states.get(agentId)?.armed)
+      this.stop(agentId, "Agent 已关闭或归档，保护取消。");
   }
 
-  private startWaiting(
-    agentId: string,
-    lastUserMessageAt: string | null,
-  ): void {
-    const state = this.state(agentId);
-    state.generation++;
-    state.pending = {
-      generation: state.generation,
-      lastUserMessageAt,
-      confirmedExhaustion: false,
-      reportId: null,
-      exhaustedWindowIds: [],
-    };
-    state.phase = "waiting";
-    state.message = "检测到额度失败；正在通过 Paseo 检查五小时窗口。";
-    this.schedule(agentId, 0);
-  }
-
-  private schedule(agentId: string, delayMs: number): void {
+  private schedule(agentId: string, delayMs: number, allowResume = true): void {
     const state = this.state(agentId);
     if (state.timer) clearTimeout(state.timer);
     state.nextCheckAt = new Date(Date.now() + delayMs).toISOString();
     const generation = state.generation;
     state.timer = setTimeout(() => {
       state.timer = null;
-      void this.check(agentId, generation).catch(() => {
-        console.error("[paseo-watchdog] internal check failed");
-        if (state.generation === generation && state.pending) {
-          state.phase = "waiting";
-          state.message = "内部检查失败；将在 15 分钟后重试。";
-          this.schedule(agentId, CHECK_EVERY_MS);
-        }
+      void this.check(agentId, generation, allowResume).catch(() => {
+        if (!state.armed || state.generation !== generation) return;
+        state.phase = "waiting";
+        state.message = "检查失败；15 分钟后重试。未发送继续消息。";
+        this.schedule(agentId, CHECK_EVERY_MS);
       });
     }, delayMs);
   }
 
-  private async stillSafe(
+  private async check(
     agentId: string,
     generation: number,
-  ): Promise<boolean> {
+    allowResume: boolean,
+  ): Promise<void> {
     const state = this.state(agentId);
-    const pending = state.pending;
-    if (
-      !state.armed ||
-      !pending ||
-      pending.generation !== generation ||
-      !this.paseo
-    ) {
-      return false;
-    }
+    const current = () => state.armed && state.generation === generation;
+    if (!current() || !this.paseo) return;
+    const activityVersion = state.activityVersion;
+    state.phase = "checking";
+    state.nextCheckAt = null;
     const snapshot = (await this.paseo.agents.ref(agentId).refresh())?.agent;
-    if (!state.armed || state.pending?.generation !== generation) return false;
+    if (!current()) return;
     if (
       !snapshot ||
       snapshot.provider !== "claude" ||
-      snapshot.archivedAt ||
-      snapshot.status === "closed"
+      snapshot.status === "closed" ||
+      snapshot.archivedAt
     ) {
-      this.stop(agentId, "Agent 不可用、已关闭或归档，持续保护停止。");
-      return false;
-    }
-    if (
-      snapshot.activeTurn ||
-      snapshot.pendingPermissions?.length ||
-      (snapshot.lastUserMessageAt ?? null) !== pending.lastUserMessageAt
-    ) {
-      this.standby(
-        agentId,
-        "检测到新任务、新消息或待处理确认，取消本次恢复；持续保护仍开启。",
-      );
-      return false;
-    }
-    return true;
-  }
-
-  private async check(agentId: string, generation: number): Promise<void> {
-    if (!(await this.stillSafe(agentId, generation))) return;
-    const state = this.state(agentId);
-    if (
-      !state.armed ||
-      state.generation !== generation ||
-      state.pending?.generation !== generation
-    )
+      this.stop(agentId, "Agent 不可用、已关闭或归档，保护停止。");
       return;
-    state.phase = "checking";
-    state.nextCheckAt = null;
-
+    }
     let quota;
     try {
       quota = assessClaudeUsage(
         await queryPaseoUsage(agentId),
         Date.now(),
-        state.pending?.exhaustedWindowIds,
+        state.exhaustedWindowIds,
       );
-    } catch (error) {
-      if (!state.pending || state.generation !== generation) return;
+    } catch {
+      if (!current()) return;
       state.lastCheckAt = new Date().toISOString();
       state.phase = "waiting";
-      const code =
-        error && typeof error === "object" && "code" in error
-          ? String(error.code)
-          : "CLI/JSON ERROR";
-      state.message = `Paseo Usage 查询失败（${code}）；请检查 daemon 的 paseo CLI，15 分钟后重试。`;
+      state.message =
+        "Paseo Usage 查询失败；请检查 daemon 的 paseo CLI，15 分钟后重试。";
       this.schedule(agentId, CHECK_EVERY_MS);
       return;
     }
-
-    if (!state.pending || state.generation !== generation) return;
+    if (!current()) return;
     state.lastCheckAt = new Date().toISOString();
-    state.resetsAt = quota.resetsAt;
     state.usedPct = quota.usedPct;
+    state.resetsAt = quota.resetsAt;
+    if (quota.reportId && state.reportId && quota.reportId !== state.reportId) {
+      this.stop(agentId, "Paseo 返回的账号已改变；为避免错用额度，保护停止。");
+      return;
+    }
+    if (quota.reportId) state.reportId = quota.reportId;
+    state.exhaustedWindowIds = [
+      ...new Set([...state.exhaustedWindowIds, ...quota.exhaustedWindowIds]),
+    ];
+    const resetMs = Date.parse(quota.resetsAt ?? "");
+    const knownReset = Number.isFinite(resetMs) && resetMs > Date.now();
+    this.schedule(
+      agentId,
+      knownReset ? resetMs - Date.now() + RESET_GRACE_MS : CHECK_EVERY_MS,
+    );
+    state.phase =
+      state.pending || quota.state !== "ready" ? "waiting" : "armed";
+    state.message = knownReset
+      ? "持续保护已开启；将在五小时窗口重置后约一分钟检查，仅恢复明确的额度中断。"
+      : "暂未取得未来重置时间；15 分钟后重试，仅恢复明确的额度中断。";
+    if (quota.state !== "ready")
+      state.message = quota.reason + "；已安排下次检查。";
 
+    const pending = state.pending;
     if (
-      quota.reportId &&
-      state.pending.reportId &&
-      quota.reportId !== state.pending.reportId
+      !allowResume ||
+      quota.state !== "ready" ||
+      !pending ||
+      pending.activityVersion !== activityVersion
+    )
+      return;
+    const finalSnapshot = (await this.paseo.agents.ref(agentId).refresh())
+      ?.agent;
+    // No awaits between this cancellation check, consuming the interruption, and send.
+    if (
+      !current() ||
+      state.pending !== pending ||
+      state.activityVersion !== activityVersion
+    )
+      return;
+    if (
+      !finalSnapshot ||
+      finalSnapshot.provider !== "claude" ||
+      finalSnapshot.status === "closed" ||
+      finalSnapshot.archivedAt
     ) {
-      this.stop(agentId, "Paseo 返回的账号已改变；为避免错用额度，监控停止。 ");
+      this.stop(agentId, "Agent 不可用、已关闭或归档，保护停止。");
       return;
     }
-
-    if (quota.state === "blocked") {
-      state.pending.confirmedExhaustion = true;
-      state.pending.reportId = quota.reportId;
-      state.pending.exhaustedWindowIds = [
-        ...new Set([
-          ...state.pending.exhaustedWindowIds,
-          ...quota.exhaustedWindowIds,
-        ]),
-      ];
-    }
-    if (quota.state === "ready" && state.pending.confirmedExhaustion) {
-      if (!(await this.stillSafe(agentId, generation))) return;
-      // Cancellation can run after stillSafe resolves but before this continuation.
-      if (
-        !state.armed ||
-        state.generation !== generation ||
-        state.pending?.generation !== generation
-      )
-        return;
-      // Consume this interruption before sending; later turns can report a new one.
-      this.standby(
-        agentId,
-        "额度已恢复；正在向原 Agent 发送一次通用继续指令。",
-      );
-      const resumeGeneration = state.generation;
-      state.phase = "resuming";
-      try {
-        await this.paseo!.agents.ref(agentId).send(CONTINUE_PROMPT);
-        if (!state.armed || state.generation !== resumeGeneration) return;
-        state.phase = "armed";
-        state.message =
-          "已发送一次『继续当前未完成的任务。』；持续保护仍开启，可处理后续额度中断。";
-      } catch {
-        if (!state.armed || state.generation !== resumeGeneration) return;
-        this.standby(
-          agentId,
-          "恢复消息发送失败或结果未知，不重发本次消息；持续保护仍开启。",
-        );
-      }
+    if (
+      finalSnapshot.activeTurn ||
+      finalSnapshot.status === "running" ||
+      finalSnapshot.status === "initializing" ||
+      finalSnapshot.pendingPermissions?.length ||
+      (finalSnapshot.lastUserMessageAt ?? null) !== pending.lastUserMessageAt
+    ) {
+      state.pending = null;
+      state.phase = "armed";
+      state.message =
+        "检测到新任务、新消息或待处理确认，取消本次恢复；窗口检查仍保留。";
       return;
     }
-
-    state.phase = "waiting";
-    state.message =
-      quota.state === "ready"
-        ? "额度看起来可用，但监控尚未亲自观察到额度耗尽；暂不发送消息。"
-        : quota.reason;
-    let delayMs = CHECK_EVERY_MS;
-    if (quota.state === "blocked" && quota.resetsAt) {
-      const resetMs = Date.parse(quota.resetsAt);
-      if (Number.isFinite(resetMs) && resetMs > Date.now()) {
-        // One check after the known reset is cheaper than polling throughout the window.
-        delayMs = resetMs - Date.now() + RESET_GRACE_MS;
-      }
+    state.pending = null;
+    state.phase = "resuming";
+    state.message = "额度可用；正在向原 Agent 发送一次继续指令。";
+    try {
+      await this.paseo.agents.ref(agentId).send(CONTINUE_PROMPT);
+      if (!current() || state.activityVersion !== activityVersion) return;
+      state.phase = "armed";
+      state.message = "已发送一次继续消息；持续保护仍开启，下个窗口再检查。";
+    } catch {
+      if (!current() || state.activityVersion !== activityVersion) return;
+      state.phase = "armed";
+      state.message = "发送失败或结果未知，不重发本次消息；下个窗口仍会检查。";
     }
-    this.schedule(agentId, delayMs);
   }
 
   dispose(): void {
-    for (const state of this.states.values()) {
-      if (state.timer) clearTimeout(state.timer);
-      state.timer = null;
-      state.generation++;
-      state.armed = false;
-      state.pending = null;
-    }
+    for (const agentId of this.states.keys())
+      this.stop(agentId, "插件已停止。");
     this.states.clear();
     this.paseo = null;
   }

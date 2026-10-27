@@ -58,7 +58,12 @@ after(() => {
   syncBuiltinESMExports();
 });
 
-function usage(usedPct, weekly = 20, id = "claude:test-account") {
+function usage(
+  usedPct = 30,
+  weekly = 20,
+  id = "claude:test-account",
+  resetAt = Date.now() + 5 * 3_600_000,
+) {
   return [
     {
       id,
@@ -70,7 +75,7 @@ function usage(usedPct, weekly = 20, id = "claude:test-account") {
           {
             id: "five_hour",
             usedPct,
-            resetsAt: new Date(Date.now() + 3_600_000).toISOString(),
+            resetsAt: resetAt === null ? null : new Date(resetAt).toISOString(),
           },
           {
             id: "weekly",
@@ -83,8 +88,15 @@ function usage(usedPct, weekly = 20, id = "claude:test-account") {
   ];
 }
 
+const quotaFailure = {
+  kind: "failed",
+  error: { message: "Usage limit reached" },
+};
+const flush = () => setImmediate();
+
 function setup(t) {
   usageQueries = 0;
+  queryUsage = async () => usage();
   t.mock.timers.enable({
     apis: ["Date", "setTimeout"],
     now: Date.parse("2026-01-01T00:00:00Z"),
@@ -94,10 +106,11 @@ function setup(t) {
   const sent = [];
   const snapshot = {
     provider: "claude",
-    status: "error",
-    lastError: "Usage limit reached",
+    status: "idle",
+    lastError: null,
     activeTurn: null,
     archivedAt: null,
+    pendingPermissions: [],
     lastUserMessageAt: "2026-01-01T00:00:00Z",
   };
   const ref = {
@@ -121,130 +134,245 @@ function setup(t) {
     t.mock.timers.tick(
       Math.max(0, Date.parse(status.nextCheckAt) - Date.now()),
     );
-    await setImmediate();
+    await flush();
   };
-  return { watchdog, snapshot, ref, paseo, sent, control, poll };
+  const start = async () => {
+    await control("on");
+    await poll();
+  };
+  const fail = async () => {
+    snapshot.status = "error";
+    snapshot.lastError = quotaFailure.error.message;
+    await watchdog.onTurnEnded("test-agent", "claude", quotaFailure, paseo);
+  };
+  return { watchdog, snapshot, ref, paseo, sent, control, poll, start, fail };
 }
 
-test("recovery sends once for this interruption and keeps protection enabled", async (t) => {
+test("enable queries immediately, then waits for reset plus one minute without intermediate usage calls", async (t) => {
   const f = setup(t);
+  const resetAt = Date.now() + 5 * 3_600_000;
+  await f.start();
+  const initial = await f.control("status");
+  assert.equal(usageQueries, 1);
+  assert.equal(initial.usedPct, 30);
+  assert.equal(initial.resetsAt, new Date(resetAt).toISOString());
+  assert.equal(Date.parse(initial.nextCheckAt), resetAt + 60_000);
+  t.mock.timers.tick(2 * 3_600_000);
+  await flush();
+  await f.fail();
+  await f.control("status");
   await f.control("on");
-  queryUsage = async () => usage(100);
-  await f.poll();
-  queryUsage = async () => usage(10);
-  await f.poll();
+  assert.equal(
+    usageQueries,
+    1,
+    "Commands and quota events must not query usage mid-window",
+  );
+  assert.equal((await f.control("status")).nextCheckAt, initial.nextCheckAt);
+  t.mock.timers.tick(resetAt + 60_000 - Date.now() - 1);
+  await flush();
+  assert.equal(usageQueries, 1);
+  assert.equal(f.sent.length, 0);
+  t.mock.timers.tick(1);
+  await flush();
+  assert.equal(usageQueries, 2);
   assert.deepEqual(f.sent, ["继续当前未完成的任务。"]);
   assert.equal((await f.control("status")).phase, "armed");
-  t.mock.timers.tick(7 * 86_400_000);
-  await setImmediate();
+});
+
+test("initial check populates status but never sends, even when enabling after a quota failure", async (t) => {
+  const f = setup(t);
+  f.snapshot.status = "error";
+  f.snapshot.lastError = "Usage limit reached";
+  await f.start();
+  assert.equal(f.sent.length, 0);
+  await f.poll();
+  assert.equal(f.sent.length, 1);
+  await f.poll();
   assert.equal(f.sent.length, 1);
 });
 
-test("ready quota without prior exhaustion never resumes", async (t) => {
+test("normal completion, manual cancellation and unrelated errors never become quota recovery", async (t) => {
   const f = setup(t);
-  await f.control("on");
-  queryUsage = async () => usage(10);
-  await f.poll();
-  assert.equal(f.sent.length, 0);
-  assert.equal((await f.control("status")).phase, "waiting");
+  await f.start();
+  for (const outcome of [
+    { kind: "completed" },
+    { kind: "canceled", reason: "user" },
+    { kind: "failed", error: { message: "network timeout" } },
+  ]) {
+    f.watchdog.onTurnStarted("test-agent");
+    await f.watchdog.onTurnEnded("test-agent", "claude", outcome, f.paseo);
+    await f.poll();
+    assert.equal(f.sent.length, 0);
+    assert.equal((await f.control("status")).phase, "armed");
+  }
 });
 
-for (const cancel of ["off", "turn", "archive", "dispose"]) {
-  test(`${cancel} in the final refresh/send gap prevents sending`, async (t) => {
-    const f = setup(t);
-    await f.control("on");
-    queryUsage = async () => usage(100);
+test("one activation covers more than 48 hours and ten quota windows", async (t) => {
+  const f = setup(t);
+  await f.start();
+  for (let cycle = 0; cycle < 10; cycle++) {
+    f.watchdog.onTurnStarted("test-agent");
+    await f.fail();
     await f.poll();
+    assert.equal(f.sent.length, cycle + 1);
+    assert.equal((await f.control("status")).phase, "armed");
+  }
+  assert.ok(Date.now() - Date.parse("2026-01-01T00:00:00Z") > 48 * 3_600_000);
+  assert.equal(usageQueries, 11);
+});
+
+test("cancellation clears this recovery while retaining the reset timer and future protection", async (t) => {
+  const f = setup(t);
+  await f.start();
+  await f.fail();
+  const planned = (await f.control("status")).nextCheckAt;
+  await f.watchdog.onTurnEnded(
+    "test-agent",
+    "claude",
+    { kind: "canceled", reason: "user" },
+    f.paseo,
+  );
+  assert.equal((await f.control("status")).nextCheckAt, planned);
+  await f.poll();
+  assert.equal(f.sent.length, 0);
+  f.watchdog.onTurnStarted("test-agent");
+  await f.fail();
+  await f.poll();
+  assert.equal(f.sent.length, 1);
+});
+
+for (const cancel of ["off", "turn", "complete", "archive", "dispose"]) {
+  test(`${cancel} before final refresh resolves prevents sending`, async (t) => {
+    const f = setup(t);
+    await f.start();
+    await f.fail();
     let refreshCount = 0;
     f.ref.refresh = () => {
       const result = Promise.resolve({ agent: { ...f.snapshot } });
-      if (++refreshCount === 2) {
-        result.then(() =>
-          queueMicrotask(() => {
-            if (cancel === "off") void f.control("off");
-            else if (cancel === "turn") f.watchdog.onTurnStarted("test-agent");
-            else if (cancel === "archive")
-              f.watchdog.onArchivedOrClosed("test-agent");
-            else f.watchdog.dispose();
-          }),
-        );
-      }
+      if (++refreshCount === 2)
+        result.then(() => {
+          if (cancel === "off") void f.control("off");
+          else if (cancel === "turn") f.watchdog.onTurnStarted("test-agent");
+          else if (cancel === "complete")
+            void f.watchdog.onTurnEnded(
+              "test-agent",
+              "claude",
+              { kind: "completed" },
+              f.paseo,
+            );
+          else if (cancel === "archive")
+            f.watchdog.onArchivedOrClosed("test-agent");
+          else f.watchdog.dispose();
+        });
       return result;
     };
-    queryUsage = async () => usage(10);
     await f.poll();
     assert.equal(f.sent.length, 0);
-    assert.equal((await f.control("status")).nextCheckAt, null);
+    assert.equal(
+      Boolean((await f.control("status")).nextCheckAt),
+      ["turn", "complete"].includes(cancel),
+    );
+  });
+}
+
+for (const change of ["message", "activeTurn", "permission", "running"]) {
+  test(`a new ${change} prevents resuming old work`, async (t) => {
+    const f = setup(t);
+    await f.start();
+    await f.fail();
+    if (change === "message")
+      f.snapshot.lastUserMessageAt = "2026-01-01T00:01:00Z";
+    if (change === "activeTurn") f.snapshot.activeTurn = { id: "other-turn" };
+    if (change === "permission")
+      f.snapshot.pendingPermissions = [{ requestId: "test-permission" }];
+    if (change === "running") f.snapshot.status = "running";
+    await f.poll();
+    assert.equal(f.sent.length, 0);
+    assert.equal((await f.control("status")).phase, "armed");
   });
 }
 
 for (const missing of ["null", "absent"]) {
   test(`previously exhausted weekly quota becoming ${missing} blocks recovery`, async (t) => {
     const f = setup(t);
-    await f.control("on");
     queryUsage = async () => usage(10, 100);
-    await f.poll();
+    await f.start();
+    await f.fail();
     queryUsage = async () => {
-      const result = usage(10, null);
-      if (missing === "absent") result[0].report.windows.pop();
-      return result;
+      const value = usage(10, null);
+      if (missing === "absent") value[0].report.windows.pop();
+      return value;
     };
     await f.poll();
     assert.equal(f.sent.length, 0);
-    assert.equal((await f.control("status")).phase, "waiting");
     queryUsage = async () => usage(10, 20);
     await f.poll();
     assert.equal(f.sent.length, 1);
   });
 }
 
-test("remembers earlier exhausted windows across later blocked reports", async (t) => {
+test("weekly exhaustion blocks sending even after five-hour quota recovers", async (t) => {
   const f = setup(t);
-  await f.control("on");
+  await f.start();
+  await f.fail();
   queryUsage = async () => usage(10, 100);
   await f.poll();
-  queryUsage = async () => usage(100, 10);
-  await f.poll();
+  assert.equal(f.sent.length, 0);
+  assert.equal(
+    Date.parse((await f.control("status")).nextCheckAt) - Date.now(),
+    5 * 3_600_000 + 60_000,
+  );
+});
+
+test("stale or missing usage cannot authorize resuming", async (t) => {
+  const f = setup(t);
+  await f.start();
+  await f.fail();
   queryUsage = async () => {
-    const result = usage(10);
-    result[0].report.windows.pop();
-    return result;
+    const value = usage();
+    value[0].fetchedAt = "2025-01-01T00:00:00Z";
+    return value;
   };
   await f.poll();
   assert.equal(f.sent.length, 0);
+  assert.equal(
+    Date.parse((await f.control("status")).nextCheckAt) - Date.now(),
+    15 * 60_000,
+  );
 });
 
-test("checks one minute after a near reset instead of waiting fifteen minutes", async (t) => {
+test("binds the account at enable time even when quota is not exhausted", async (t) => {
   const f = setup(t);
-  await f.control("on");
-  const resetAt = Date.now() + 60_000;
-  queryUsage = async () => {
-    const result = usage(100);
-    result[0].report.windows[0].resetsAt = new Date(resetAt).toISOString();
-    return result;
-  };
+  await f.start();
+  await f.fail();
+  queryUsage = async () => usage(10, 20, "claude:other-test-account");
   await f.poll();
+  assert.equal(f.sent.length, 0);
+  assert.equal((await f.control("status")).phase, "stopped");
+});
+
+test("no reset timestamp falls back to fifteen minutes", async (t) => {
+  const f = setup(t);
+  queryUsage = async () => usage(30, 20, "claude:test-account", null);
+  await f.start();
+  assert.equal(
+    Date.parse((await f.control("status")).nextCheckAt) - Date.now(),
+    15 * 60_000,
+  );
+});
+
+test("an imminent reset is checked one minute after reset", async (t) => {
+  const f = setup(t);
+  const resetAt = Date.now() + 60_000;
+  queryUsage = async () => usage(30, 20, "claude:test-account", resetAt);
+  await f.start();
   assert.equal(
     Date.parse((await f.control("status")).nextCheckAt),
     resetAt + 60_000,
   );
 });
 
-test("manual off wins while usage is being fetched", async (t) => {
-  const f = setup(t);
-  await f.control("on");
-  queryUsage = async () => usage(100);
-  await f.poll();
-  queryUsage = async () => {
-    await f.control("off");
-    return usage(10);
-  };
-  await f.poll();
-  assert.equal(f.sent.length, 0);
-  assert.equal((await f.control("status")).phase, "stopped");
-});
-
-test("manual off wins while initial arming refresh is pending", async (t) => {
+test("off during initial agent refresh wins", async (t) => {
   const f = setup(t);
   let finish;
   f.ref.refresh = () =>
@@ -256,268 +384,138 @@ test("manual off wins while initial arming refresh is pending", async (t) => {
   finish({ agent: { ...f.snapshot } });
   await arming;
   assert.equal((await f.control("status")).phase, "stopped");
+  assert.equal(usageQueries, 0);
 });
 
-test("a new user message cancels this recovery but keeps protection enabled", async (t) => {
+test("off during usage query prevents send and rescheduling", async (t) => {
   const f = setup(t);
-  await f.control("on");
-  queryUsage = async () => usage(100);
-  await f.poll();
-  f.snapshot.lastUserMessageAt = "2026-01-01T00:01:00Z";
-  queryUsage = async () => usage(10);
-  await f.poll();
-  assert.equal(f.sent.length, 0);
-  assert.equal((await f.control("status")).phase, "armed");
-});
-
-test("an account change cancels recovery", async (t) => {
-  const f = setup(t);
-  await f.control("on");
-  queryUsage = async () => usage(100);
-  await f.poll();
-  queryUsage = async () => usage(10, 20, "claude:other-test-account");
-  await f.poll();
-  assert.equal(f.sent.length, 0);
-  assert.equal((await f.control("status")).phase, "stopped");
-});
-
-test("CLI errors wait without disclosing the raw error or sending", async (t) => {
-  const f = setup(t);
-  await f.control("on");
+  await f.start();
+  await f.fail();
   queryUsage = async () => {
-    throw Object.assign(new Error("synthetic-private-error"), {
-      code: "ENOENT",
-    });
+    await f.control("off");
+    return usage();
   };
   await f.poll();
-  const status = await f.control("status");
   assert.equal(f.sent.length, 0);
-  assert.equal(status.phase, "waiting");
-  assert.equal(status.message.includes("synthetic-private-error"), false);
-  assert.equal(Date.parse(status.nextCheckAt) - Date.now(), 15 * 60_000);
-});
-
-test("a send error never automatically retries", async (t) => {
-  const f = setup(t);
-  await f.control("on");
-  queryUsage = async () => usage(100);
-  await f.poll();
-  let attempts = 0;
-  f.ref.send = async () => {
-    attempts++;
-    throw new Error("Synthetic send failure");
-  };
-  queryUsage = async () => usage(10);
-  await f.poll();
-  t.mock.timers.tick(7 * 86_400_000);
-  await setImmediate();
-  assert.equal(attempts, 1);
-  assert.equal((await f.control("status")).phase, "armed");
-});
-
-test("agent refresh failures retry without exposing private error details", async (t) => {
-  const f = setup(t);
-  await f.control("on");
-  const logs = [];
-  t.mock.method(console, "error", (...args) => logs.push(args.join(" ")));
-  const refresh = f.ref.refresh;
-  f.ref.refresh = async () => {
-    throw new Error("synthetic-private-error");
-  };
-  await f.poll();
-  const status = await f.control("status");
-  assert.equal(status.phase, "waiting");
-  assert.equal(Date.parse(status.nextCheckAt) - Date.now(), 15 * 60_000);
-  assert.equal(f.sent.length, 0);
-  assert.equal(logs.length, 1);
-  assert.equal(logs[0].includes("synthetic-private-error"), false);
-  f.ref.refresh = refresh;
-  queryUsage = async () => usage(100);
-  await f.poll();
-  queryUsage = async () => usage(10);
-  await f.poll();
-  assert.equal(f.sent.length, 1);
-});
-
-test("ordinary completion, cancellation and other failures keep protection without sending", async (t) => {
-  const f = setup(t);
-  f.snapshot.status = "idle";
-  await f.control("on");
-  for (const outcome of [
-    { kind: "completed" },
-    { kind: "canceled", reason: "user" },
-    { kind: "failed", error: { message: "network timeout" } },
-  ]) {
-    f.watchdog.onTurnStarted("test-agent");
-    await f.watchdog.onTurnEnded("test-agent", "claude", outcome, f.paseo);
-    assert.equal((await f.control("status")).phase, "armed");
-  }
-  assert.equal(f.sent.length, 0);
-  assert.equal(usageQueries, 0);
-});
-
-const quotaFailure = {
-  kind: "failed",
-  error: { message: "Usage limit reached" },
-};
-
-test("protection remains after 48 hours and resumes a later quota interruption", async (t) => {
-  const f = setup(t);
-  f.snapshot.status = "idle";
-  await f.control("on");
-  await f.watchdog.onTurnEnded(
-    "test-agent",
-    "claude",
-    { kind: "completed" },
-    f.paseo,
-  );
-  t.mock.timers.tick(48 * 3_600_000);
-  await setImmediate();
-  assert.equal((await f.control("status")).phase, "armed");
-  assert.equal(usageQueries, 0);
-  f.watchdog.onTurnStarted("test-agent");
-  f.snapshot.status = "error";
-  await f.watchdog.onTurnEnded("test-agent", "claude", quotaFailure, f.paseo);
-  queryUsage = async () => usage(100);
-  await f.poll();
-  queryUsage = async () => usage(10);
-  await f.poll();
-  assert.equal(f.sent.length, 1);
-  assert.equal((await f.control("status")).phase, "armed");
-});
-
-test("one activation recovers across multiple quota windows", async (t) => {
-  const f = setup(t);
-  await f.control("on");
-  for (let cycle = 0; cycle < 3; cycle++) {
-    queryUsage = async () => usage(100);
-    await f.poll();
-    queryUsage = async () => usage(10);
-    await f.poll();
-    assert.equal(f.sent.length, cycle + 1);
-    assert.equal((await f.control("status")).phase, "armed");
-    if (cycle < 2) {
-      f.watchdog.onTurnStarted("test-agent");
-      await f.watchdog.onTurnEnded(
-        "test-agent",
-        "claude",
-        { kind: "completed" },
-        f.paseo,
-      );
-      t.mock.timers.tick(12 * 3_600_000);
-      await setImmediate();
-      await f.watchdog.onTurnEnded(
-        "test-agent",
-        "claude",
-        quotaFailure,
-        f.paseo,
-      );
-    }
-  }
-});
-
-test("manual cancellation cancels a pending resume but permits future quota recovery", async (t) => {
-  const f = setup(t);
-  await f.control("on");
-  queryUsage = async () => usage(100);
-  await f.poll();
-  await f.watchdog.onTurnEnded(
-    "test-agent",
-    "claude",
-    { kind: "canceled", reason: "user" },
-    f.paseo,
-  );
-  t.mock.timers.tick(7 * 86_400_000);
-  await setImmediate();
-  assert.equal(f.sent.length, 0);
-  assert.equal((await f.control("status")).phase, "armed");
-  assert.equal((await f.control("status")).nextCheckAt, null);
-  f.watchdog.onTurnStarted("test-agent");
-  await f.watchdog.onTurnEnded("test-agent", "claude", quotaFailure, f.paseo);
-  queryUsage = async () => usage(100);
-  await f.poll();
-  queryUsage = async () => usage(10);
-  await f.poll();
-  assert.equal(f.sent.length, 1);
-});
-
-test("an old send acknowledgement cannot override a manual off", async (t) => {
-  const f = setup(t);
-  await f.control("on");
-  queryUsage = async () => usage(100);
-  await f.poll();
-  let acknowledge;
-  f.ref.send = async (text) => {
-    f.sent.push(text);
-    await new Promise((resolve) => {
-      acknowledge = resolve;
-    });
-  };
-  queryUsage = async () => usage(10);
-  await f.poll();
-  assert.equal((await f.control("status")).phase, "resuming");
-  await f.control("off");
-  acknowledge();
-  await setImmediate();
-  assert.equal((await f.control("status")).phase, "stopped");
-  assert.equal(f.sent.length, 1);
-  await f.watchdog.onTurnEnded("test-agent", "claude", quotaFailure, f.paseo);
   assert.equal((await f.control("status")).nextCheckAt, null);
 });
 
-test("a new quota failure before send acknowledgement retains its own recovery state", async (t) => {
+test("turn events do not discard the initial usage query or move its reset timer", async (t) => {
   const f = setup(t);
-  await f.control("on");
-  queryUsage = async () => usage(100);
-  await f.poll();
-  f.ref.send = async (text) => {
-    f.sent.push(text);
+  queryUsage = async () => {
     f.watchdog.onTurnStarted("test-agent");
-    await f.watchdog.onTurnEnded("test-agent", "claude", quotaFailure, f.paseo);
+    return usage(42);
   };
-  queryUsage = async () => usage(10);
-  await f.poll();
-  assert.equal(f.sent.length, 1);
-  assert.equal((await f.control("status")).phase, "waiting");
-  await f.poll();
-  assert.equal(
-    f.sent.length,
-    1,
-    "A new interruption must observe exhaustion again",
-  );
+  await f.start();
+  assert.equal((await f.control("status")).usedPct, 42);
+  assert.equal(usageQueries, 1);
 });
 
-test("a new turn invalidates an older quota failure while its refresh is pending", async (t) => {
+test("a stale quota event cannot attach to a newer turn", async (t) => {
   const f = setup(t);
-  f.snapshot.status = "idle";
-  await f.control("on");
+  await f.start();
   let finish;
+  const original = f.ref.refresh;
   f.ref.refresh = () =>
     new Promise((resolve) => {
       finish = resolve;
     });
-  const waiting = f.watchdog.onTurnEnded(
-    "test-agent",
-    "claude",
-    quotaFailure,
-    f.paseo,
-  );
+  const ending = f.fail();
   f.watchdog.onTurnStarted("test-agent");
   finish({ agent: { ...f.snapshot } });
-  await waiting;
+  await ending;
+  f.ref.refresh = original;
+  await f.poll();
+  assert.equal(f.sent.length, 0);
+});
+
+test("query errors and refresh errors retry without exposing private details", async (t) => {
+  const f = setup(t);
+  await f.start();
+  await f.fail();
+  queryUsage = async () => {
+    throw new Error("synthetic-private-error");
+  };
+  await f.poll();
+  assert.equal(
+    (await f.control("status")).message.includes("synthetic-private-error"),
+    false,
+  );
+  assert.equal(
+    Date.parse((await f.control("status")).nextCheckAt) - Date.now(),
+    15 * 60_000,
+  );
+  const original = f.ref.refresh;
+  f.ref.refresh = async () => {
+    throw new Error("synthetic-private-error");
+  };
+  await f.poll();
+  assert.equal(
+    (await f.control("status")).message.includes("synthetic-private-error"),
+    false,
+  );
+  f.ref.refresh = original;
+  queryUsage = async () => usage();
+  await f.poll();
+  assert.equal(f.sent.length, 1);
+});
+
+test("uncertain send is never retried for the same interruption", async (t) => {
+  const f = setup(t);
+  await f.start();
+  await f.fail();
+  let attempts = 0;
+  f.ref.send = async () => {
+    attempts++;
+    throw new Error("synthetic-private-error");
+  };
+  await f.poll();
+  await f.poll();
+  await f.poll();
+  assert.equal(attempts, 1);
   assert.equal((await f.control("status")).phase, "armed");
+});
+
+test("late send acknowledgement cannot override off", async (t) => {
+  const f = setup(t);
+  await f.start();
+  await f.fail();
+  let acknowledge;
+  f.ref.send = async () => {
+    await new Promise((resolve) => {
+      acknowledge = resolve;
+    });
+  };
+  await f.poll();
+  assert.equal((await f.control("status")).phase, "resuming");
+  await f.control("off");
+  acknowledge();
+  await flush();
+  assert.equal((await f.control("status")).phase, "stopped");
   assert.equal((await f.control("status")).nextCheckAt, null);
 });
 
-test("pending permissions prevent a resume while retaining future protection", async (t) => {
+test("a new quota failure before the old send acknowledgement keeps its own pending recovery", async (t) => {
   const f = setup(t);
-  await f.control("on");
-  queryUsage = async () => usage(100);
+  await f.start();
+  await f.fail();
+  f.ref.send = async (text) => {
+    f.sent.push(text);
+    f.watchdog.onTurnStarted("test-agent");
+    await f.fail();
+  };
   await f.poll();
-  f.snapshot.pendingPermissions = [{ requestId: "test-permission" }];
-  queryUsage = async () => usage(10);
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.control("status")).phase, "waiting");
   await f.poll();
+  assert.equal(f.sent.length, 2);
+});
+
+test("unavailable or archived agent stops protection", async (t) => {
+  const f = setup(t);
+  await f.start();
+  f.snapshot.archivedAt = new Date().toISOString();
+  await f.poll();
+  assert.equal((await f.control("status")).phase, "stopped");
   assert.equal(f.sent.length, 0);
-  assert.equal((await f.control("status")).phase, "armed");
-  assert.equal((await f.control("status")).nextCheckAt, null);
 });

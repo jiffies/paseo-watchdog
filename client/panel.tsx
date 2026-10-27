@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import type { RpcOutput } from "@getpaseo/plugin";
 import { useRpc, type PluginAgentPanelProps } from "@getpaseo/plugin/client";
@@ -15,21 +15,39 @@ export function WatchdogPanel({ agentId, theme }: PluginAgentPanelProps) {
   const [state, setState] = useState<State | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    try {
-      setState(await control({ agentId, action: "status" }));
-      setError(null);
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setLoading(false);
-    }
-  }, [control, agentId]);
+  const [refreshVersion, setRefreshVersion] = useState(0);
 
   useEffect(() => {
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setState(null);
+    setError(null);
+    async function refresh() {
+      setLoading(true);
+      try {
+        const next = await control({ agentId, action: "status" });
+        if (active) {
+          setState(next);
+          setError(null);
+        }
+      } catch {
+        if (active) {
+          setState(null);
+          setError("无法读取最新状态，请稍后重试。");
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+          timer = setTimeout(refresh, 3_000);
+        }
+      }
+    }
     void refresh();
-  }, [refresh]);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [control, agentId, refreshVersion]);
 
   const foreground = theme.colors.foreground;
   const muted = theme.colors.foregroundMuted ?? foreground;
@@ -49,6 +67,9 @@ export function WatchdogPanel({ agentId, theme }: PluginAgentPanelProps) {
         {state?.message ?? "读取状态中…"}
       </Text>
       <Text style={{ color: muted }}>状态：{state?.phase ?? "—"}</Text>
+      <Text selectable style={{ color: muted }}>
+        监控对象 Agent：{agentId}
+      </Text>
       <Text style={{ color: muted }}>
         五小时已使用：
         {state?.usedPct == null ? "—" : `${state.usedPct.toFixed(1)}%`}
@@ -68,7 +89,7 @@ export function WatchdogPanel({ agentId, theme }: PluginAgentPanelProps) {
       <Pressable
         accessibilityRole="button"
         onPress={() => {
-          void refresh();
+          setRefreshVersion((version) => version + 1);
         }}
         disabled={loading}
         style={{
@@ -84,8 +105,9 @@ export function WatchdogPanel({ agentId, theme }: PluginAgentPanelProps) {
       <Text style={{ color: muted, marginTop: 12 }}>
         命令：/paseo-watchdog 开启；/paseo-watchdog off 取消；/paseo-watchdog
         status 查询。
-        持续保护整个会话；每次额度中断确认恢复后发送一次继续指令，普通回复结束不会关闭保护。
-        15 分钟是缺少重置时间时的查询间隔，不是保护时长。插件重载或 daemon
+        启用时查询额度，之后在五小时窗口重置后约一分钟检查；正常完成或主动取消不会自动续跑。
+        面板每 3 秒只更新已缓存的状态，不查询额度、不调用 Claude。
+        缺少重置时间或查询失败时每 15 分钟重试。插件重载或 daemon
         重启后需重新开启。
       </Text>
     </View>
